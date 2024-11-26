@@ -1,6 +1,7 @@
 #ifndef EXAMPLES_SERVER_CONFIG_H
 #define EXAMPLES_SERVER_CONFIG_H
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -12,17 +13,27 @@
 class Config {
 public:
     Config(const std::string& filename)
-        : config_filename(filename) {}
+        : config_filename(filename) {
+            
+        if (std::filesystem::exists(filename) == false) {
+            SdWebuiSettings initConfig;
+            this->settings = initConfig;
+            this->save();
+        }
+    }
 
     bool load() {
         std::lock_guard<std::mutex> lock(config_mutex);
         try {
+            nlohmann::json tmpj;
             std::ifstream input_file(config_filename);
             if (!input_file.is_open()) {
                 std::cerr << "Error opening config file for reading.\n";
                 return false;
             }
-            input_file >> this->settings;
+            input_file >> tmpj;
+            auto test = tmpj.get<SdWebuiSettings>();
+            this->settings = tmpj;
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Failed to load config: " << e.what() << std::endl;
@@ -55,7 +66,18 @@ public:
     /// default-constructed `T` is returned.
     template <typename T>
     T get(const std::string& key) const {
-        return settings.get<T>(key);
+        if (settings.contains(key)) {
+            return settings[key].get<T>();
+        }
+        return T();
+    }
+
+    std::string getString(const std::string& key) const {
+        return settings[key].get<std::string>();
+    }
+
+    bool getBool(const std::string& key) const {
+        return settings[key].get<bool>();
     }
 
     /// Check if a setting exists.

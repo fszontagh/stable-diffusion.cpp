@@ -8,13 +8,13 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "SDModelScanner.h"
+#include "config.h"
+#include "http_json_requests.h"
+#include "http_json_responses.h"
 #include "httplib.h"
 #include "json.hpp"
 #include "sd.h"
-#include "server/SDModelScanner.h"
-#include "server/config.h"
-#include "server/http_json_requests.h"
-#include "server/http_json_responses.h"
 #include "stable-diffusion.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -393,7 +393,12 @@ namespace http {
                     this->sd_params_.control_strength,
                     this->sd_params_.style_strength,
                     this->sd_params_.normalize_input,
-                    this->sd_params_.input_id_images_path.c_str());
+                    this->sd_params_.input_id_images_path.c_str(),
+                    this->sd_params_.skip_layers,
+                    this->sd_params_.skip_layers_count,
+                    this->sd_params_.slg_scale,
+                    this->sd_params_.skip_layer_start,
+                    this->sd_params_.skip_layer_end);
 
                 if (results == NULL) {
                     response["error"] = "Empty results";
@@ -504,7 +509,8 @@ namespace http {
                 this->sd_params_.schedule,
                 this->sd_params_.clip_on_cpu,
                 this->sd_params_.controlnet_on_cpu,
-                this->sd_params_.vae_on_cpu);
+                this->sd_params_.vae_on_cpu,
+                this->sd_params_.diffusion_flash_attn);
         };
     };
 

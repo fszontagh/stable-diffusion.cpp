@@ -3,24 +3,20 @@
 #include <memory>
 #include <string>
 
+#include "config.h"
 #include "httplib.h"
 #include "sd.h"
-#include "config.h"
 
 static std::string models_path = "./";  // sd-models endpoint
 static std::string vaes_path;           // sd-modules endpoint
 static std::string embeddings_path;     // sd-embeddings endpoint
 static std::string loras_path;          // sd-loras endpoint
 static std::string controlnet_path;
-static std::string esrgan_path;         // upscalers
-
-static std::string output_path = "./output";  // where the images are stored
+static std::string esrgan_path;  // upscalers
 
 static std::string config_file = "./config.json";
 
-
-
-#include "server/http_callbacks.h"
+#include "http_callbacks.h"
 
 // https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/latent_formats.py#L152-L169
 
@@ -42,6 +38,11 @@ int main(int argc, const char* argv[]) {
     normalizePath(config_file);
 
     std::shared_ptr<Config> config = std::make_shared<Config>(config_file);
+    if (config->load() == false) {
+        std::cerr << "Can not load config file: " << config->getConfigFile() << std::endl;
+        return 1;
+    }
+    std::cout << "Loaded config file: " << config->getConfigFile() << std::endl;
 
     sd_set_log_callback(sd_log_cb, nullptr);
 
@@ -56,6 +57,13 @@ int main(int argc, const char* argv[]) {
         return res.set_content("", "application/json");
     });
     svr->set_logger(log_server_request);
+
+    auto output_path = config->getString("outdir_samples");
+    normalizePath(output_path);
+
+    if (!std::filesystem::exists(output_path)) {
+        std::filesystem::create_directories(output_path);
+    }
 
     svr->set_mount_point("/files", output_path);
 

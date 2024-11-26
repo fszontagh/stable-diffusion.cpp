@@ -13,7 +13,6 @@
 #include "httplib.h"
 #include "json.hpp"
 #include "model.h"
-#include "server/latent_preview.h"
 #include "stable-diffusion.h"
 
 #include "http_json_responses.h"
@@ -166,10 +165,14 @@ struct SDParams {
     // Photomaker params
     std::string input_id_images_path;
 
-    std::vector<int> skip_layers = {7, 8, 9};
-    float slg_scale              = 0.;
-    float skip_layer_start       = 0.01;
-    float skip_layer_end         = 0.2;
+    int* skip_layers      = NULL;  // 7 8 9
+    int skip_layers_count = 0;
+
+    bool diffusion_flash_attn = false;
+
+    float slg_scale        = 0.;
+    float skip_layer_start = 0.01;
+    float skip_layer_end   = 0.2;
 };
 
 inline void parse_args(int argc, const char** argv, std::string& server_host, unsigned int& port, std::string& models_path, std::string& vaes_path, std::string& embeddings_path, std::string& loras_path, std::string& controlnet_path, std::string& esrgan_path, std::string& config_file) {
@@ -319,11 +322,11 @@ inline std::string get_image_params(SDParams params, int64_t seed) {
     }
     parameter_string += "Steps: " + std::to_string(params.sample_steps) + ", ";
     parameter_string += "CFG scale: " + std::to_string(params.cfg_scale) + ", ";
-    if (params.slg_scale != 0 && params.skip_layers.size() != 0) {
+    if (params.slg_scale != 0 && params.skip_layers != NULL) {
         parameter_string += "SLG scale: " + std::to_string(params.cfg_scale) + ", ";
         parameter_string += "Skip layers: [";
-        for (const auto& layer : params.skip_layers) {
-            parameter_string += std::to_string(layer) + ", ";
+        for (int n = 0; n < (int)sizeof(params.skip_layers) / sizeof(params.skip_layers[0]); n++) {
+            parameter_string += std::to_string(params.skip_layers[n]) + ", ";
         }
         parameter_string += "], ";
         parameter_string += "Skip layer start: " + std::to_string(params.skip_layer_start) + ", ";
@@ -398,6 +401,9 @@ inline static void log_server_request(const httplib::Request& req, const httplib
 }
 
 inline static void normalizePath(std::string& path) {
+    if (path.empty()) {
+        path = ".";
+    }
     std::filesystem::path abs_path       = std::filesystem::absolute(path);
     std::filesystem::path canonical_path = std::filesystem::weakly_canonical(abs_path);
     path                                 = canonical_path.string();
