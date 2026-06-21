@@ -153,7 +153,57 @@ sd_image_t RemBGGGML::remove_background(sd_image_t input_image) {
         LOG_ERROR("rembg: u2net forward failed");
         return empty;
     }
+
+    // Min-max normalize the mask to [0,1] (the official U^2-Net postproc).
+    // This sharpens edges and avoids the soft-alpha white-bg bleed.
+    {
+        float mn = mask_small.index(0, 0, 0, 0);
+        float mx = mn;
+        for (int yy = 0; yy < kInputSize; ++yy) {
+            for (int xx = 0; xx < kInputSize; ++xx) {
+                const float v = mask_small.index(xx, yy, 0, 0);
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+        }
+        const float range = std::max(mx - mn, 1e-6f);
+        for (int yy = 0; yy < kInputSize; ++yy) {
+            for (int xx = 0; xx < kInputSize; ++xx) {
+                mask_small.index(xx, yy, 0, 0) = (mask_small.index(xx, yy, 0, 0) - mn) / range;
+            }
+        }
+    }
+
     sd::Tensor<float> mask = resize_mask_bilinear(mask_small, W, H);
+
+    // Morphological cleanup of the resized mask.
+    //  - Open (erode K then dilate K) removes small false-positive islands.
+    //  - An extra trailing erode trims the remaining white-background bleed
+    //    around the subject's outer edge.
+    auto apply_filter = [&](bool dilate) {
+        sd::Tensor<float> tmp = sd::zeros<float>({W, H, 1, 1});
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                float m = mask.index(x, y, 0, 0);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = std::clamp(x + dx, 0, W - 1);
+                        const int ny = std::clamp(y + dy, 0, H - 1);
+                        const float n = mask.index(nx, ny, 0, 0);
+                        m = dilate ? std::max(m, n) : std::min(m, n);
+                    }
+                }
+                tmp.index(x, y, 0, 0) = m;
+            }
+        }
+        std::swap(mask, tmp);
+    };
+
+    constexpr int open_radius  = 5;  // kills islands smaller than ~5 px
+    constexpr int extra_erode  = 3;  // trims residual white-bg bleed
+    for (int i = 0; i < open_radius; ++i)   apply_filter(/*dilate=*/false);
+    for (int i = 0; i < open_radius; ++i)   apply_filter(/*dilate=*/true);
+    for (int i = 0; i < extra_erode; ++i)   apply_filter(/*dilate=*/false);
 
     // Build RGBA output: keep input RGB, replace alpha with mask*255.
     sd_image_t out{};

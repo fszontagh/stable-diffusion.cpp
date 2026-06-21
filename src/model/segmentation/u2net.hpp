@@ -64,7 +64,8 @@ public:
     }
 };
 
-// Bilinear upsample of `src` to the spatial size of `target`.
+// Bilinear upsample of `src` to the spatial size of `target`. PyTorch
+// F.upsample(mode='bilinear') defaults to align_corners=False, so no flag here.
 inline ggml_tensor* upsample_like(GGMLRunnerContext* ctx, ggml_tensor* src, ggml_tensor* target) {
     return ggml_interpolate(ctx->ggml_ctx,
                             src,
@@ -72,7 +73,7 @@ inline ggml_tensor* upsample_like(GGMLRunnerContext* ctx, ggml_tensor* src, ggml
                             target->ne[1],
                             src->ne[2],
                             src->ne[3],
-                            GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
+                            GGML_SCALE_MODE_BILINEAR);
 }
 
 // 2x max-pool with ceil_mode=false. U^2-Net uses max_pool2d(2, stride=2, ceil_mode=True)
