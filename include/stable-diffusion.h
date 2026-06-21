@@ -504,6 +504,17 @@ SD_API bool upscale(upscaler_ctx_t* upscaler_ctx,
 
 SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
 
+typedef struct rembg_ctx_t rembg_ctx_t;
+
+SD_API rembg_ctx_t* new_rembg_ctx(const char* model_path,
+                                  int n_threads,
+                                  const char* backend,
+                                  const char* params_backend);
+
+SD_API sd_image_t remove_background(rembg_ctx_t* ctx, sd_image_t input_image);
+
+SD_API void free_rembg_ctx(rembg_ctx_t* ctx);
+
 SD_API bool convert(const char* input_path,
                     const char* vae_path,
                     const char* output_path,

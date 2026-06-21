@@ -33,6 +33,7 @@ const char* const modes_str[] = {
     "vid_gen",
     "convert",
     "upscale",
+    "rembg",
     "metadata",
 };
 
@@ -465,6 +466,10 @@ ArgOptions SDContextParams::get_options() {
          0,
          &esrgan_path},
         {"",
+         "--rembg-model",
+         "path to a U^2-Net background-removal model (safetensors converted from u2net.pth).",
+         &rembg_path},
+        {"",
          "--backend",
          "runtime backend assignment, e.g. cpu or clip=cpu,vae=cuda0,diffusion=vulkan0",
          (int)',',
@@ -724,8 +729,13 @@ bool SDContextParams::validate(SDMode mode) {
             LOG_ERROR("error: convert mode needs at least one model input path\n");
             return false;
         }
-    } else if (mode != UPSCALE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
+    } else if (mode != UPSCALE && mode != REMBG && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
         LOG_ERROR("error: the following arguments are required: model_path/diffusion_model\n");
+        return false;
+    }
+
+    if (mode == REMBG && rembg_path.length() == 0) {
+        LOG_ERROR("error: rembg mode needs a u2net model (--rembg-model)\n");
         return false;
     }
 
@@ -2352,6 +2362,11 @@ bool SDGenerationParams::validate(SDMode mode) {
             LOG_ERROR("error: upscale mode needs an init image (--init-img)\n");
             return false;
         }
+    }
+
+    if (mode == REMBG && init_image_path.length() == 0) {
+        LOG_ERROR("error: rembg mode needs an init image (--init-img)\n");
+        return false;
     }
 
     return true;

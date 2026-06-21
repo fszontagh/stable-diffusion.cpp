@@ -783,7 +783,7 @@ int main(int argc, const char* argv[]) {
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
 
-    if (cli_params.mode == UPSCALE) {
+    if (cli_params.mode == UPSCALE || cli_params.mode == REMBG) {
         num_results = 1;
         results.push_back(gen_params.init_image.release());
     } else {
@@ -867,6 +867,35 @@ int main(int argc, const char* argv[]) {
                     current_image.reset(upscaled_image);
                 }
                 results[i] = current_image.release();  // Set the final upscaled image as the result
+            }
+        }
+    }
+
+    if (ctx_params.rembg_path.size() > 0) {
+        struct RembgCtxDeleter {
+            void operator()(rembg_ctx_t* p) const { if (p) free_rembg_ctx(p); }
+        };
+        std::unique_ptr<rembg_ctx_t, RembgCtxDeleter> rembg_ctx(
+            new_rembg_ctx(ctx_params.rembg_path.c_str(),
+                          ctx_params.n_threads,
+                          sd_ctx_params.backend,
+                          sd_ctx_params.params_backend));
+        if (rembg_ctx == nullptr) {
+            LOG_ERROR("new_rembg_ctx failed");
+        } else {
+            for (int i = 0; i < num_results; i++) {
+                if (results[i].data == nullptr) {
+                    continue;
+                }
+                SDImageOwner current_image(results[i]);
+                results[i] = {0, 0, 0, nullptr};
+                SDImageOwner masked_image(remove_background(rembg_ctx.get(), current_image.get()));
+                if (masked_image.get().data == nullptr) {
+                    LOG_ERROR("rembg failed");
+                    results[i] = current_image.release();
+                } else {
+                    results[i] = masked_image.release();
+                }
             }
         }
     }

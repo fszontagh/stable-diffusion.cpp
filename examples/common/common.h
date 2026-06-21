@@ -16,13 +16,14 @@
 #define BOOL_STR(b) ((b) ? "true" : "false")
 
 extern const char* const modes_str[];
-#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale, metadata"
+#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale, rembg, metadata"
 
 enum SDMode {
     IMG_GEN,
     VID_GEN,
     CONVERT,
     UPSCALE,
+    REMBG,
     METADATA,
     MODE_COUNT
 };
@@ -131,6 +132,7 @@ struct SDContextParams {
     std::string audio_vae_path;
     std::string taesd_path;
     std::string esrgan_path;
+    std::string rembg_path;
     std::string control_net_path;
     std::string embedding_dir;
     std::string photo_maker_path;
