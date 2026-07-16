@@ -217,8 +217,10 @@ public:
     std::vector<std::shared_ptr<GenerationExtension>> generation_extensions;
     std::vector<std::shared_ptr<LoraModel>> runtime_lora_models;
     bool apply_lora_immediately = false;
-    bool animatediff_loaded     = false;
-    int animatediff_num_frames  = 0;
+    bool animatediff_loaded                      = false;
+    int animatediff_num_frames                   = 0;
+    const sd_image_t* animatediff_control_frames = nullptr;
+    int animatediff_control_frames_count         = 0;
 
     std::string taesd_path;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0, 0, nullptr};
@@ -4650,7 +4652,17 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         mask_image_tensor = sd::ops::round(mask_image_tensor);
     }
 
-    if (sd_img_gen_params->control_image.data != nullptr) {
+    if (sd_ctx->sd->animatediff_num_frames > 1 &&
+        sd_ctx->sd->animatediff_control_frames_count > 0 &&
+        sd_ctx->sd->animatediff_control_frames != nullptr) {
+        int n_frames         = sd_ctx->sd->animatediff_num_frames;
+        int n_ctrl           = std::min(n_frames, sd_ctx->sd->animatediff_control_frames_count);
+        control_image_tensor = sd::full<float>({request->width, request->height, 3, n_frames}, 0.5f);
+        for (int i = 0; i < n_ctrl; ++i) {
+            auto frame = sd_image_to_tensor(sd_ctx->sd->animatediff_control_frames[i], request->width, request->height);
+            sd::ops::slice_assign(&control_image_tensor, 3, i, i + 1, frame);
+        }
+    } else if (sd_img_gen_params->control_image.data != nullptr) {
         control_image_tensor = sd_image_to_tensor(sd_img_gen_params->control_image, request->width, request->height);
     }
 
@@ -4703,7 +4715,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         }
     }
 
-    if (!control_image_tensor.empty()) {
+    if (!control_image_tensor.empty() && sd_ctx->sd->animatediff_num_frames <= 1) {
         control_latent = sd_ctx->sd->encode_first_stage(control_image_tensor);
         if (control_latent.empty()) {
             LOG_ERROR("failed to encode control image");
@@ -6155,9 +6167,13 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
     img_gen_params.circular_x        = sd_vid_gen_params->circular_x;
     img_gen_params.circular_y        = sd_vid_gen_params->circular_y;
 
-    sd_ctx->sd->animatediff_num_frames = n_frames;
-    bool ok                            = generate_image(sd_ctx, &img_gen_params, frames_out, num_frames_out);
-    sd_ctx->sd->animatediff_num_frames = 0;
+    sd_ctx->sd->animatediff_num_frames           = n_frames;
+    sd_ctx->sd->animatediff_control_frames       = sd_vid_gen_params->control_frames;
+    sd_ctx->sd->animatediff_control_frames_count = sd_vid_gen_params->control_frames_size;
+    bool ok                                      = generate_image(sd_ctx, &img_gen_params, frames_out, num_frames_out);
+    sd_ctx->sd->animatediff_num_frames           = 0;
+    sd_ctx->sd->animatediff_control_frames       = nullptr;
+    sd_ctx->sd->animatediff_control_frames_count = 0;
     return ok;
 }
 

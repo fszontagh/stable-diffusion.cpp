@@ -153,6 +153,28 @@ sd-cli -M vid_gen --motion-module mm_sd15_v3.safetensors \
 
 `--strength` controls how far the motion module is allowed to deviate from the init image (higher = more motion, lower = more static).
 
+## Per-frame ControlNet
+
+An SD 1.5 ControlNet (OpenPose, Canny, Depth, ...) can be driven by a directory of N keyframes, one per output frame, via `--control-video`. The motion module still runs across frames, so the character identity stays consistent while the pose follows the sequence. Combine with `-i` for best quality.
+
+```
+sd-cli -M vid_gen \
+    --model realisticVisionV60B1.safetensors \
+    --motion-module mm_sd15_v3.safetensors \
+    --control-net control_v11p_sd15_openpose.pth \
+    --control-video ./pose_frames \
+    -i init.png --strength 0.75 \
+    --cfg-scale 7.0 --sampling-method euler --scheduler karras \
+    -p "1girl, blonde hair, red dress, park background" \
+    -H 512 -W 512 --video-frames 8 --steps 25 -s 42 -o out.avi
+```
+
+Left: OpenPose keyframes fed via `--control-video`. Right: rendered output. Character stays consistent, arm poses follow the skeleton.
+
+<img src="../assets/animatediff/controlnet_openpose_demo.gif" width="512"/>
+
+Frames beyond `--video-frames` in the directory are ignored. Frames missing (fewer than `--video-frames`) default to a mid-grey hint, which disables control on those frames.
+
 ## Notes
 
 - The motion module was trained at `video_length=16`. Running with
