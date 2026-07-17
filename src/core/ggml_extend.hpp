@@ -1079,6 +1079,58 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_pad_ext(ggml_context* ctx,
     return x;
 }
 
+// nn.ReflectionPad2d: reflection excludes the border element itself,
+// i.e. [a,b,c] with p=1 -> [b,a,b,c,b], not [a,a,b,c,c] (that is replicate).
+// ggml has no reverse op, so the mirrored edges are gathered as single
+// rows/columns and concatenated. Requires pad < dim on each padded axis.
+__STATIC_INLINE__ ggml_tensor* ggml_ext_pad_reflect_2d(ggml_context* ctx,
+                                                       ggml_tensor* x,
+                                                       int pad_w,
+                                                       int pad_h) {
+    if (pad_w == 0 && pad_h == 0) {
+        return x;
+    }
+    GGML_ASSERT(pad_w >= 0 && pad_h >= 0);
+    GGML_ASSERT(pad_w < x->ne[0] && pad_h < x->ne[1]);
+
+    if (pad_w > 0) {
+        std::vector<ggml_tensor*> parts;
+        for (int i = pad_w; i >= 1; i--) {
+            parts.push_back(ggml_cont(ctx, ggml_view_4d(ctx, x, 1, x->ne[1], x->ne[2], x->ne[3],
+                                                        x->nb[1], x->nb[2], x->nb[3], i * x->nb[0])));
+        }
+        parts.push_back(x);
+        for (int i = 1; i <= pad_w; i++) {
+            parts.push_back(ggml_cont(ctx, ggml_view_4d(ctx, x, 1, x->ne[1], x->ne[2], x->ne[3],
+                                                        x->nb[1], x->nb[2], x->nb[3], (x->ne[0] - 1 - i) * x->nb[0])));
+        }
+        ggml_tensor* acc = parts[0];
+        for (size_t i = 1; i < parts.size(); i++) {
+            acc = ggml_concat(ctx, acc, parts[i], 0);
+        }
+        x = acc;
+    }
+
+    if (pad_h > 0) {
+        std::vector<ggml_tensor*> parts;
+        for (int i = pad_h; i >= 1; i--) {
+            parts.push_back(ggml_cont(ctx, ggml_view_4d(ctx, x, x->ne[0], 1, x->ne[2], x->ne[3],
+                                                        x->nb[1], x->nb[2], x->nb[3], i * x->nb[1])));
+        }
+        parts.push_back(x);
+        for (int i = 1; i <= pad_h; i++) {
+            parts.push_back(ggml_cont(ctx, ggml_view_4d(ctx, x, x->ne[0], 1, x->ne[2], x->ne[3],
+                                                        x->nb[1], x->nb[2], x->nb[3], (x->ne[1] - 1 - i) * x->nb[1])));
+        }
+        ggml_tensor* acc = parts[0];
+        for (size_t i = 1; i < parts.size(); i++) {
+            acc = ggml_concat(ctx, acc, parts[i], 1);
+        }
+        x = acc;
+    }
+    return x;
+}
+
 __STATIC_INLINE__ ggml_tensor* ggml_ext_pad(ggml_context* ctx,
                                             ggml_tensor* x,
                                             int p0,
