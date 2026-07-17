@@ -1,9 +1,56 @@
 #ifndef __PIXELIZATION_HPP__
 #define __PIXELIZATION_HPP__
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
 #include "core/ggml_extend.hpp"
 
 namespace pixelization {
+
+// Stage dumps for the PyTorch parity harness. Enabled only when SD_PIXELIZATION_DUMP
+// names a directory; writes .npy in PyTorch [N, C, H, W] order.
+__STATIC_INLINE__ const char* stage_dump_dir() {
+    return getenv("SD_PIXELIZATION_DUMP");
+}
+
+// Copy into a dedicated output tensor so the allocator cannot reuse the buffer before the
+// stage is read back, mirroring GGMLRunnerContext::capture_tensor.
+__STATIC_INLINE__ ggml_tensor* snapshot_tensor(GGMLRunnerContext* ctx, ggml_tensor* x) {
+    ggml_tensor* snapshot = ggml_cont(ctx->ggml_ctx, x);
+    snapshot              = ggml_cpy(ctx->ggml_ctx, snapshot, ggml_dup_tensor(ctx->ggml_ctx, snapshot));
+    ggml_set_output(snapshot);
+    return snapshot;
+}
+
+__STATIC_INLINE__ void dump_stage(const std::string& name, const sd::Tensor<float>& tensor) {
+    const char* dir = stage_dump_dir();
+    if (dir == nullptr || tensor.empty()) {
+        return;
+    }
+    FILE* f = fopen((std::string(dir) + "/" + name + ".npy").c_str(), "wb");
+    if (f == nullptr) {
+        LOG_WARN("pixelization: cannot open stage dump for '%s'", name.c_str());
+        return;
+    }
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+    for (size_t i = tensor.shape().size(); i > 0; i--) {
+        header += std::to_string(tensor.shape()[i - 1]) + ",";
+    }
+    header += "), }";
+    while ((10 + header.size() + 1) % 64 != 0) {
+        header += ' ';
+    }
+    header += '\n';
+    const uint16_t header_len = (uint16_t)header.size();
+    fwrite("\x93NUMPY\x01\x00", 1, 8, f);
+    fwrite(&header_len, 2, 1, f);
+    fwrite(header.data(), 1, header.size(), f);
+    fwrite(tensor.data(), sizeof(float), tensor.numel(), f);
+    fclose(f);
+}
 
 // Upstream's "LayerNorm" (basic_layer.py:338) reduces over the WHOLE tensor and applies
 // gamma/beta per channel, so the LayerNorm block (which reduces over ne[0] only) cannot be
@@ -89,6 +136,333 @@ public:
         x = ggml_add(gc, x, ggml_reshape_4d(gc, params["bias"], 1, 1, out_c, 1));
         x = ggml_leaky_relu(gc, x, 0.2f, true);
         return ggml_scale(gc, x, std::sqrt(2.0f));
+    }
+};
+
+// basic_layer.py ConvBlock: reflect-pad -> Conv2d(padding=0) -> norm -> activation.
+//
+// Weights are raw F32 params rather than a Conv2d sub-block because Conv2d forces F16, which
+// costs more than the 1e-4 parity budget once ~30 of these are chained.
+//
+// norm='in' is nn.InstanceNorm2d, whose default is affine=False, so there are no norm params in
+// the checkpoint. ggml_ext_group_norm handles groups == channels correctly, but hardcodes
+// eps=1e-6; ggml_group_norm is called directly to get PyTorch's 1e-5.
+class ConvBlockPx : public UnaryBlock {
+protected:
+    int64_t in_c, out_c;
+    int ksize, stride, padding;
+    std::string norm, activation;
+
+    void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
+        params["conv.weight"] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ksize, ksize, in_c, out_c);
+        params["conv.bias"]   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_c);
+    }
+
+public:
+    ConvBlockPx(int64_t in_c,
+                int64_t out_c,
+                int ksize,
+                int stride,
+                int padding,
+                const std::string& norm       = "none",
+                const std::string& activation = "relu")
+        : in_c(in_c), out_c(out_c), ksize(ksize), stride(stride), padding(padding), norm(norm), activation(activation) {
+        if (norm == "ln") {
+            blocks["norm"] = std::shared_ptr<GGMLBlock>(new WholeTensorNorm(out_c));
+        }
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        auto gc = ctx->ggml_ctx;
+
+        x = ggml_ext_pad_reflect_2d(gc, x, padding, padding);
+        x = ggml_ext_conv_2d(gc, x, params["conv.weight"], params["conv.bias"], stride, stride, 0, 0, 1, 1);
+
+        if (norm == "in") {
+            x = ggml_group_norm(gc, x, (int)out_c, 1e-5f);
+        } else if (norm == "ln") {
+            x = std::dynamic_pointer_cast<WholeTensorNorm>(blocks["norm"])->forward(ctx, x);
+        }
+
+        if (activation == "relu") {
+            x = ggml_relu_inplace(gc, x);
+        } else if (activation == "tanh") {
+            x = ggml_tanh_inplace(gc, x);
+        }
+        return x;
+    }
+};
+
+class ResBlockPx : public UnaryBlock {
+public:
+    explicit ResBlockPx(int64_t dim) {
+        blocks["model.0"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, dim, 3, 1, 1, "in", "relu"));
+        blocks["model.1"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, dim, 3, 1, 1, "in", "none"));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        ggml_tensor* residual = x;
+        ggml_tensor* out      = std::dynamic_pointer_cast<ConvBlockPx>(blocks["model.0"])->forward(ctx, x);
+        out                   = std::dynamic_pointer_cast<ConvBlockPx>(blocks["model.1"])->forward(ctx, out);
+        return ggml_add(ctx->ggml_ctx, out, residual);
+    }
+};
+
+class ResBlocksPx : public UnaryBlock {
+protected:
+    int num_blocks;
+    std::string cut_group;
+
+public:
+    ResBlocksPx(int num_blocks, int64_t dim, const std::string& cut_group)
+        : num_blocks(num_blocks), cut_group(cut_group) {
+        for (int i = 0; i < num_blocks; i++) {
+            blocks["model." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new ResBlockPx(dim));
+        }
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        for (int i = 0; i < num_blocks; i++) {
+            x = std::dynamic_pointer_cast<ResBlockPx>(blocks["model." + std::to_string(i)])->forward(ctx, x);
+            sd::ggml_graph_cut::mark_graph_cut(x, cut_group + "." + std::to_string(i), "x");
+        }
+        return x;
+    }
+};
+
+class RGBEncoderPx : public UnaryBlock {
+protected:
+    int n_downsample;
+
+public:
+    RGBEncoderPx(int64_t in_dim, int64_t dim, int n_downsample, int n_res, const std::string& cut_group)
+        : n_downsample(n_downsample) {
+        blocks["model.0"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(in_dim, dim, 7, 1, 3, "in", "relu"));
+        for (int i = 0; i < n_downsample; i++) {
+            blocks["model." + std::to_string(i + 1)] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, 2 * dim, 4, 2, 1, "in", "relu"));
+            dim *= 2;
+        }
+        blocks["model." + std::to_string(n_downsample + 1)] = std::shared_ptr<GGMLBlock>(new ResBlocksPx(n_res, dim, cut_group + ".res"));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        for (int i = 0; i <= n_downsample; i++) {
+            x = std::dynamic_pointer_cast<ConvBlockPx>(blocks["model." + std::to_string(i)])->forward(ctx, x);
+        }
+        return std::dynamic_pointer_cast<ResBlocksPx>(blocks["model." + std::to_string(n_downsample + 1)])->forward(ctx, x);
+    }
+};
+
+// Shared upsample tail of both decoders (c2pGen.py:254-262 and :63-71). A base class rather
+// than a sub-block: upstream holds conv_1..3 directly on each decoder, so an extra block level
+// would not match the checkpoint names.
+class RGBDecoderTailPx : public GGMLBlock {
+public:
+    RGBDecoderTailPx(int64_t dim, int64_t out_dim) {
+        blocks["conv_1"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, dim / 2, 5, 1, 2, "ln", "relu"));
+        dim /= 2;
+        blocks["conv_2"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, dim / 2, 5, 1, 2, "ln", "relu"));
+        dim /= 2;
+        blocks["conv_3"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, out_dim, 7, 1, 3, "none", "tanh"));
+    }
+
+    ggml_tensor* forward_tail(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        auto gc = ctx->ggml_ctx;
+        x       = std::dynamic_pointer_cast<ConvBlockPx>(blocks["conv_1"])->forward(ctx, ggml_upscale(gc, x, 2, GGML_SCALE_MODE_NEAREST));
+        x       = std::dynamic_pointer_cast<ConvBlockPx>(blocks["conv_2"])->forward(ctx, ggml_upscale(gc, x, 2, GGML_SCALE_MODE_NEAREST));
+        return std::dynamic_pointer_cast<ConvBlockPx>(blocks["conv_3"])->forward(ctx, x);
+    }
+};
+
+class RGBDecoderPx : public RGBDecoderTailPx {
+public:
+    RGBDecoderPx(int64_t dim, int64_t out_dim)
+        : RGBDecoderTailPx(dim, out_dim) {
+        blocks["mod_conv_1"] = std::shared_ptr<GGMLBlock>(new ModulationConvBlock(dim, dim, 3));
+        blocks["mod_conv_2"] = std::shared_ptr<GGMLBlock>(new ModulationConvBlock(dim, dim, 3));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* code) {
+        auto gc = ctx->ggml_ctx;
+
+        auto slice_code = [&](int i) {
+            return ggml_view_1d(gc, code, 256, (size_t)i * 256 * sizeof(float));
+        };
+        auto mc1 = std::dynamic_pointer_cast<ModulationConvBlock>(blocks["mod_conv_1"]);
+        auto mc2 = std::dynamic_pointer_cast<ModulationConvBlock>(blocks["mod_conv_2"]);
+
+        // Blocks 2..4 reuse mod_conv_2 rather than mod_conv_3..8 (c2pGen.py:242-251). This
+        // matches the released weights, which were trained against this graph; mod_conv_3..8
+        // never saw gradients and hold N(0, 0.02) noise. Not a typo -- do not "fix".
+        ggml_tensor* residual = x;
+        x                     = mc1->forward(ctx, x, slice_code(0));
+        if (stage_dump_enabled_) {
+            capture(ctx, "mod1", x);
+        }
+        x = mc2->forward(ctx, x, slice_code(1));
+        if (stage_dump_enabled_) {
+            capture(ctx, "mod2", x);
+        }
+        x = ggml_add(gc, x, residual);
+        sd::ggml_graph_cut::mark_graph_cut(x, "pixelization.c2p.dec.mod.0", "x");
+        for (int pair = 1; pair < 4; pair++) {
+            residual = x;
+            x        = mc2->forward(ctx, x, slice_code(pair * 2));
+            x        = mc2->forward(ctx, x, slice_code(pair * 2 + 1));
+            x        = ggml_add(gc, x, residual);
+            sd::ggml_graph_cut::mark_graph_cut(x, "pixelization.c2p.dec.mod." + std::to_string(pair), "x");
+        }
+        return forward_tail(ctx, x);
+    }
+
+    // Stage captures are owned by the runner, which reads them back after compute.
+    void set_stage_sink(std::vector<std::pair<std::string, ggml_tensor*>>* sink) {
+        stage_sink_         = sink;
+        stage_dump_enabled_ = sink != nullptr;
+    }
+
+protected:
+    std::vector<std::pair<std::string, ggml_tensor*>>* stage_sink_ = nullptr;
+    bool stage_dump_enabled_                                       = false;
+
+    void capture(GGMLRunnerContext* ctx, const std::string& name, ggml_tensor* x) {
+        stage_sink_->push_back({name, snapshot_tensor(ctx, x)});
+    }
+};
+
+class AliasRGBDecoderPx : public RGBDecoderTailPx {
+public:
+    AliasRGBDecoderPx(int64_t dim, int64_t out_dim, int n_res)
+        : RGBDecoderTailPx(dim, out_dim) {
+        blocks["Res_Blocks"] = std::shared_ptr<GGMLBlock>(new ResBlocksPx(n_res, dim, "pixelization.alias.dec.res"));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        x = std::dynamic_pointer_cast<ResBlocksPx>(blocks["Res_Blocks"])->forward(ctx, x);
+        return forward_tail(ctx, x);
+    }
+};
+
+class C2PGenNet : public GGMLBlock {
+public:
+    C2PGenNet(int64_t in_dim, int64_t out_dim, int64_t dim, int n_downsample, int n_res) {
+        blocks["rgb_enc"] = std::shared_ptr<GGMLBlock>(new RGBEncoderPx(in_dim, dim, n_downsample, n_res, "pixelization.c2p.enc"));
+        blocks["rgb_dec"] = std::shared_ptr<GGMLBlock>(new RGBDecoderPx(dim << n_downsample, out_dim));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* code, std::vector<std::pair<std::string, ggml_tensor*>>* stage_sink) {
+        auto dec = std::dynamic_pointer_cast<RGBDecoderPx>(blocks["rgb_dec"]);
+        dec->set_stage_sink(stage_sink);
+
+        x = std::dynamic_pointer_cast<RGBEncoderPx>(blocks["rgb_enc"])->forward(ctx, x);
+        if (stage_sink != nullptr) {
+            stage_sink->push_back({"rgb_enc", snapshot_tensor(ctx, x)});
+        }
+        return dec->forward(ctx, x, code);
+    }
+};
+
+class AliasNetPx : public UnaryBlock {
+public:
+    AliasNetPx(int64_t in_dim, int64_t out_dim, int64_t dim, int n_downsample, int n_res) {
+        blocks["rgb_enc"] = std::shared_ptr<GGMLBlock>(new RGBEncoderPx(in_dim, dim, n_downsample, n_res, "pixelization.alias.enc"));
+        blocks["rgb_dec"] = std::shared_ptr<GGMLBlock>(new AliasRGBDecoderPx(dim << n_downsample, out_dim, n_res));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        x = std::dynamic_pointer_cast<RGBEncoderPx>(blocks["rgb_enc"])->forward(ctx, x);
+        return std::dynamic_pointer_cast<AliasRGBDecoderPx>(blocks["rgb_dec"])->forward(ctx, x);
+    }
+};
+
+struct C2PGenRunner : public GGMLRunner {
+    std::unique_ptr<C2PGenNet> net;
+    std::vector<std::pair<std::string, ggml_tensor*>> stage_tensors;
+
+    C2PGenRunner(ggml_backend_t backend,
+                 const String2TensorStorage& tensor_storage_map      = {},
+                 std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : GGMLRunner(backend, weight_manager),
+          net(std::make_unique<C2PGenNet>(3, 3, 64, 2, 4)) {
+        net->init(params_ctx, tensor_storage_map, "c2p");
+    }
+
+    std::string get_desc() override {
+        return "c2pgen";
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
+        net->get_param_tensors(tensors, "c2p");
+    }
+
+    ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor, const sd::Tensor<float>& code_tensor) {
+        constexpr int kGraphNodes = 1 << 16;  // 65k
+        ggml_cgraph* gf           = new_graph_custom(kGraphNodes);
+        ggml_tensor* x            = make_input(x_tensor);
+        ggml_tensor* code         = make_input(code_tensor);
+
+        stage_tensors.clear();
+        auto runner_ctx  = get_context();
+        ggml_tensor* out = net->forward(&runner_ctx, x, code, stage_dump_dir() != nullptr ? &stage_tensors : nullptr);
+        for (const auto& stage : stage_tensors) {
+            ggml_build_forward_expand(gf, stage.second);
+        }
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    sd::Tensor<float> compute(const int n_threads,
+                              const sd::Tensor<float>& x,
+                              const std::vector<float>& code) {
+        GGML_ASSERT(code.size() == 2048);
+        sd::Tensor<float> code_tensor({(int64_t)code.size()}, code);
+        auto get_graph = [&]() -> ggml_cgraph* { return build_graph(x, code_tensor); };
+        auto result    = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+        for (const auto& stage : stage_tensors) {
+            // ggml_n_dims drops the trailing batch of 1, which the [N, C, H, W] dump needs back.
+            dump_stage(stage.first, restore_trailing_singleton_dims(sd::make_sd_tensor_from_ggml<float>(stage.second), 4));
+        }
+        dump_stage("dec_out", result);
+        return result;
+    }
+};
+
+struct AliasNetRunner : public GGMLRunner {
+    std::unique_ptr<AliasNetPx> net;
+
+    AliasNetRunner(ggml_backend_t backend,
+                   const String2TensorStorage& tensor_storage_map      = {},
+                   std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : GGMLRunner(backend, weight_manager),
+          net(std::make_unique<AliasNetPx>(3, 3, 64, 2, 3)) {
+        net->init(params_ctx, tensor_storage_map, "alias");
+    }
+
+    std::string get_desc() override {
+        return "aliasnet";
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
+        net->get_param_tensors(tensors, "alias");
+    }
+
+    ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor) {
+        constexpr int kGraphNodes = 1 << 16;  // 65k
+        ggml_cgraph* gf           = new_graph_custom(kGraphNodes);
+        ggml_tensor* x            = make_input(x_tensor);
+
+        auto runner_ctx  = get_context();
+        ggml_tensor* out = net->forward(&runner_ctx, x);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    sd::Tensor<float> compute(const int n_threads,
+                              const sd::Tensor<float>& x) {
+        auto get_graph = [&]() -> ggml_cgraph* { return build_graph(x); };
+        auto result    = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+        dump_stage("alias_out", result);
+        return result;
     }
 };
 
