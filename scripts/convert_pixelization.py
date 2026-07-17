@@ -9,8 +9,6 @@ import gguf
 import numpy as np
 import torch
 
-PX_DIR_DEFAULT = "/tmp/claude-1000/-data-sdcpp-fork/fc17739a-410e-47b7-9096-8714cf497cfb/scratchpad/px"
-
 DEAD = [f"mod_conv_{i}" for i in range(3, 9)]  # untrained noise, unreachable; see spec 2.3
 
 
@@ -38,7 +36,7 @@ def build_style_code(px_dir, g_state):
         G.load_state_dict(g_state)
         G.eval()
 
-        ref = process(greyscale(Image.open("reference.png").convert("L")))
+        ref = process(greyscale(Image.open("reference.png")))
     with torch.no_grad():
         code = G.MLP(G.PBEnc(ref)).flatten()
     code = code / code.abs().max()  # exact: demodulation is scale-invariant; see spec 2.2
@@ -112,11 +110,21 @@ def self_test(gguf_path):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--models", default="/data/SD_MODELS/pixelization")
-    p.add_argument("--px-dir", default=PX_DIR_DEFAULT)
+    p.add_argument(
+        "--px-dir",
+        required=False,
+        help=(
+            "Path to a checkout of arenasys/pixelization_inference "
+            "(not part of sd.cpp; no canonical location). Required unless "
+            "--self-test is used."
+        ),
+    )
     p.add_argument("--out", default="pixelization.gguf")
     p.add_argument("--self-test", metavar="GGUF", default=None)
     a = p.parse_args()
     if a.self_test:
         self_test(a.self_test)
     else:
+        if not a.px_dir:
+            p.error("the following arguments are required: --px-dir")
         convert(a)
