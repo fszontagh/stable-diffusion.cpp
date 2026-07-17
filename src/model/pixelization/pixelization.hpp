@@ -375,6 +375,200 @@ public:
     }
 };
 
+// torchvision VGG19 `features`, truncated after layer 19: PixelBlockEncoder taps conv1_1/2_1/3_1
+// /4_1 and never reads past conv4_1, so layers 21..36 are not instantiated.
+//
+// Taps are POST-ReLU despite indices 0/5/10/19 naming convs. get_features (c2pGen.py:152) stashes
+// a reference to x after the conv runs, but torchvision's VGG19 uses nn.ReLU(inplace=True), so the
+// next layer (1/6/11/20) rewrites that same storage. The dict therefore observes relu(conv(x)).
+// Verified against the fixture: every PyTorch tap is non-negative.
+//
+// These weights come from `c2p.pb_enc.vgg.*`, NOT the standalone `vgg.features.*` group. C2PGen
+// initializes this VGG from pixelart_vgg19.pth but load_state_dict then overwrites it with the
+// trained copy in 160_net_G_A.pth; the two differ (~0.3 absolute), so the group is not redundant.
+class VGG19TapsPx : public GGMLBlock {
+protected:
+    // conv index -> (in, out). Zero padding: torchvision uses nn.Conv2d(padding=1) directly.
+    static const std::vector<std::pair<int, std::pair<int64_t, int64_t>>>& conv_specs() {
+        static const std::vector<std::pair<int, std::pair<int64_t, int64_t>>> specs = {
+            {0, {3, 64}},
+            {2, {64, 64}},
+            {5, {64, 128}},
+            {7, {128, 128}},
+            {10, {128, 256}},
+            {12, {256, 256}},
+            {14, {256, 256}},
+            {16, {256, 256}},
+            {19, {256, 512}},
+        };
+        return specs;
+    }
+
+public:
+    VGG19TapsPx() {
+        for (const auto& spec : conv_specs()) {
+            blocks[std::to_string(spec.first)] = std::shared_ptr<GGMLBlock>(
+                new Conv2d(spec.second.first, spec.second.second, {3, 3}, {1, 1}, {1, 1}));
+        }
+    }
+
+    struct Taps {
+        ggml_tensor* conv1_1;
+        ggml_tensor* conv2_1;
+        ggml_tensor* conv3_1;
+        ggml_tensor* conv4_1;
+    };
+
+    Taps forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        auto gc      = ctx->ggml_ctx;
+        auto conv    = [&](int i, ggml_tensor* t) {
+            return std::dynamic_pointer_cast<Conv2d>(blocks[std::to_string(i)])->forward(ctx, t);
+        };
+        auto maxpool = [&](ggml_tensor* t) {
+            return ggml_pool_2d(gc, t, GGML_OP_POOL_MAX, 2, 2, 2, 2, 0, 0);
+        };
+
+        Taps taps;
+        taps.conv1_1 = ggml_relu(gc, conv(0, x));
+        x            = ggml_relu(gc, conv(2, taps.conv1_1));
+        x            = maxpool(x);
+
+        taps.conv2_1 = ggml_relu(gc, conv(5, x));
+        x            = ggml_relu(gc, conv(7, taps.conv2_1));
+        x            = maxpool(x);
+
+        taps.conv3_1 = ggml_relu(gc, conv(10, x));
+        x            = ggml_relu(gc, conv(12, taps.conv3_1));
+        x            = ggml_relu(gc, conv(14, x));
+        x            = ggml_relu(gc, conv(16, x));
+        x            = maxpool(x);
+
+        taps.conv4_1 = ggml_relu(gc, conv(19, x));
+        return taps;
+    }
+};
+
+class PixelBlockEncoderPx : public UnaryBlock {
+public:
+    PixelBlockEncoderPx(int64_t in_dim, int64_t dim, int64_t style_dim) {
+        blocks["vgg"] = std::shared_ptr<GGMLBlock>(new VGG19TapsPx());
+        // norm='none' throughout (c2pGen.py:79), unlike RGBEncoder's 'in'.
+        blocks["conv1"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(in_dim, dim, 7, 1, 3, "none", "relu"));
+        dim *= 2;
+        blocks["conv2"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, dim, 4, 2, 1, "none", "relu"));
+        dim *= 2;
+        blocks["conv3"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, dim, 4, 2, 1, "none", "relu"));
+        dim *= 2;
+        blocks["conv4"] = std::shared_ptr<GGMLBlock>(new ConvBlockPx(dim, dim, 4, 2, 1, "none", "relu"));
+        dim *= 2;
+        blocks["model.1"] = std::shared_ptr<GGMLBlock>(new Conv2d(dim, style_dim, {1, 1}));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        auto gc   = ctx->ggml_ctx;
+        auto conv = [&](const std::string& name, ggml_tensor* t) {
+            return std::dynamic_pointer_cast<ConvBlockPx>(blocks[name])->forward(ctx, t);
+        };
+
+        auto taps = std::dynamic_pointer_cast<VGG19TapsPx>(blocks["vgg"])->forward(ctx, x);
+
+        x = ggml_concat(gc, conv("conv1", x), taps.conv1_1, 2);
+        x = ggml_concat(gc, conv("conv2", x), taps.conv2_1, 2);
+        x = ggml_concat(gc, conv("conv3", x), taps.conv3_1, 2);
+        x = ggml_concat(gc, conv("conv4", x), taps.conv4_1, 2);
+
+        // AdaptiveAvgPool2d(1) == mean over H and W. ggml_mean reduces ne[0] only, so fold the
+        // [W, H, C, 1] spatial plane into one row per channel first.
+        x = ggml_cont(gc, x);
+        x = ggml_mean(gc, ggml_reshape_2d(gc, x, x->ne[0] * x->ne[1], x->ne[2]));
+        x = ggml_reshape_4d(gc, x, 1, 1, x->ne[1], 1);
+        return std::dynamic_pointer_cast<Conv2d>(blocks["model.1"])->forward(ctx, x);
+    }
+};
+
+// basic_layer.py:172 sets style1 = style0 and blends with a=0, so the interpolation collapses to
+// model[3](model[0:3](style0)). The dead branch is upstream's, not ours.
+class MLPPx : public UnaryBlock {
+public:
+    MLPPx(int64_t in_dim, int64_t out_dim, int64_t dim) {
+        blocks["model.0.fc"] = std::shared_ptr<GGMLBlock>(new Linear(in_dim, in_dim));
+        blocks["model.1.fc"] = std::shared_ptr<GGMLBlock>(new Linear(in_dim, dim));
+        blocks["model.2.fc"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim));
+        blocks["model.3.fc"] = std::shared_ptr<GGMLBlock>(new Linear(dim, out_dim));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        auto gc = ctx->ggml_ctx;
+        auto fc = [&](const std::string& name, ggml_tensor* t) {
+            return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, t);
+        };
+        for (int i = 0; i < 3; i++) {
+            x = ggml_relu(gc, fc("model." + std::to_string(i) + ".fc", x));
+        }
+        return fc("model.3.fc", x);
+    }
+};
+
+class StyleEncoderNet : public UnaryBlock {
+public:
+    StyleEncoderNet(int64_t in_dim, int64_t dim, int64_t style_dim, int64_t out_dim, int64_t mlp_dim) {
+        blocks["pb_enc"] = std::shared_ptr<GGMLBlock>(new PixelBlockEncoderPx(in_dim, dim, style_dim));
+        blocks["mlp"]    = std::shared_ptr<GGMLBlock>(new MLPPx(style_dim, out_dim, mlp_dim));
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        ggml_tensor* code = std::dynamic_pointer_cast<PixelBlockEncoderPx>(blocks["pb_enc"])->forward(ctx, x);
+        code              = ggml_reshape_2d(ctx->ggml_ctx, code, code->ne[2], 1);
+        return std::dynamic_pointer_cast<MLPPx>(blocks["mlp"])->forward(ctx, code);
+    }
+};
+
+// Runs once at load when --pixelization-ref overrides the baked default_style_code, never per
+// tile. The returned code is RAW (absmax ~8.4e8) to match Task 1's baked convention: normalizing
+// it shrinks ModulationConvBlock's demodulation sum until its internal 1e-8 eps matters.
+struct StyleEncoderRunner : public GGMLRunner {
+    std::unique_ptr<StyleEncoderNet> net;
+
+    StyleEncoderRunner(ggml_backend_t backend,
+                       const String2TensorStorage& tensor_storage_map      = {},
+                       std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : GGMLRunner(backend, weight_manager),
+          net(std::make_unique<StyleEncoderNet>(3, 64, 256, 2048, 256)) {
+        net->init(params_ctx, tensor_storage_map, "c2p");
+    }
+
+    std::string get_desc() override {
+        return "style_encoder";
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
+        net->get_param_tensors(tensors, "c2p");
+    }
+
+    ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor) {
+        constexpr int kGraphNodes = 1 << 12;
+        ggml_cgraph* gf           = new_graph_custom(kGraphNodes);
+        ggml_tensor* x            = make_input(x_tensor);
+
+        auto runner_ctx  = get_context();
+        ggml_tensor* out = net->forward(&runner_ctx, x);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    // ref_image must be greyscale replicated across 3 channels (pixelization.py:46), not RGB.
+    std::vector<float> compute(const int n_threads, const sd::Tensor<float>& ref_image) {
+        auto get_graph = [&]() -> ggml_cgraph* { return build_graph(ref_image); };
+        auto result    = take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false));
+        if (result.empty()) {
+            return {};
+        }
+        std::vector<float> code(result.data(), result.data() + result.numel());
+        dump_stage("style_code", result);
+        return code;
+    }
+};
+
 struct C2PGenRunner : public GGMLRunner {
     std::unique_ptr<C2PGenNet> net;
     std::vector<std::pair<std::string, ggml_tensor*>> stage_tensors;
