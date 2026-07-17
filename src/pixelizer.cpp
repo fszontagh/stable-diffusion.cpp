@@ -21,7 +21,7 @@ int64_t round_half_even_to_multiple(int64_t size, int multiple) {
 }
 
 // Python's // floors; C division truncates toward zero. The two disagree on the negative odd
-// offsets produced when the rounded size grows (any size ≡ 3 mod 4).
+// offsets produced when the rounded size grows (any size 3 mod 4).
 int64_t floor_div2(int64_t value) {
     return (int64_t)std::floor((double)value / 2.0);
 }
@@ -296,8 +296,11 @@ sd_image_t PixelizerGGML::pixelize(sd_image_t input_image) {
     sd_image_t pixelized_image = {0, 0, 0, nullptr};
 
     sd::Tensor<float> input_tensor = center_crop_to_multiple(sd_image_to_tensor(input_image), kSizeMultiple);
-    if (input_tensor.shape()[0] < kSizeMultiple || input_tensor.shape()[1] < kSizeMultiple) {
-        LOG_ERROR("pixelization needs an input of at least %dx%d", kSizeMultiple, kSizeMultiple);
+    // The encoder downsamples twice and reflect-pads at each stage, and reflect padding requires
+    // pad < extent, so anything under two crop multiples aborts inside ggml_ext_pad_reflect_2d.
+    constexpr int kMinSize = kSizeMultiple * 2;
+    if (input_tensor.shape()[0] < kMinSize || input_tensor.shape()[1] < kMinSize) {
+        LOG_ERROR("pixelization needs an input of at least %dx%d", kMinSize, kMinSize);
         return pixelized_image;
     }
     scale_to_signed(input_tensor);
