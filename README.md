@@ -71,6 +71,7 @@ API and command-line option may change frequently.***
   - Latent Consistency Models support (LCM/LCM-LoRA)
   - Faster and memory efficient latent decoding with [TAESD](./docs/taesd.md)
   - Upscale images generated with [ESRGAN](./docs/esrgan.md)
+  - Turn images into pixel art with [Pixelization](./docs/pixelization.md)
 - Supported backends
   - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
   - CUDA
