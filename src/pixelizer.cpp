@@ -14,24 +14,48 @@ constexpr int kSizeMultiple  = 4;
 constexpr int kPixelBlock    = 4;
 constexpr int64_t kStyleCode = 2048;
 
-// pixelization.py:52-67 crops to a multiple of 4 around the centre before normalizing.
+// Python's round() is round-half-to-even, so std::rint (default FE_TONEAREST) is the match here
+// and std::lround (half-away-from-zero) is not: it disagrees for e.g. 250 and 258.
+int64_t round_half_even_to_multiple(int64_t size, int multiple) {
+    return (int64_t)std::rint((double)size / multiple) * multiple;
+}
+
+// Python's // floors; C division truncates toward zero. The two disagree on the negative odd
+// offsets produced when the rounded size grows (any size ≡ 3 mod 4).
+int64_t floor_div2(int64_t value) {
+    return (int64_t)std::floor((double)value / 2.0);
+}
+
+// pixelization.py:52-67 crops to a multiple of 4 around the centre before normalizing. The rounded
+// size can exceed the source, in which case upstream hands PIL.crop out-of-bounds coordinates and
+// PIL silently pads with black rather than erroring; reads outside the source reproduce that by
+// leaving the zero-filled output untouched. Cropping happens on the [0,1] tensor before
+// scale_to_signed, so black is 0.0 here.
 sd::Tensor<float> center_crop_to_multiple(const sd::Tensor<float>& input, int multiple) {
     const int64_t ow = input.shape()[0];
     const int64_t oh = input.shape()[1];
-    const int64_t nw = (int64_t)std::lround((double)ow / multiple) * multiple;
-    const int64_t nh = (int64_t)std::lround((double)oh / multiple) * multiple;
+    const int64_t nw = round_half_even_to_multiple(ow, multiple);
+    const int64_t nh = round_half_even_to_multiple(oh, multiple);
     if (nw == ow && nh == oh) {
         return input;
     }
-    const int64_t left = (ow - nw) / 2;
-    const int64_t top  = (oh - nh) / 2;
+    const int64_t left = floor_div2(ow - nw);
+    const int64_t top  = floor_div2(oh - nh);
 
     sd::Tensor<float> out = sd::zeros<float>({nw, nh, input.shape()[2], input.shape()[3]});
     for (int64_t n = 0; n < out.shape()[3]; n++) {
         for (int64_t c = 0; c < out.shape()[2]; c++) {
             for (int64_t y = 0; y < nh; y++) {
+                const int64_t sy = top + y;
+                if (sy < 0 || sy >= oh) {
+                    continue;
+                }
                 for (int64_t x = 0; x < nw; x++) {
-                    out.index(x, y, c, n) = input.index(left + x, top + y, c, n);
+                    const int64_t sx = left + x;
+                    if (sx < 0 || sx >= ow) {
+                        continue;
+                    }
+                    out.index(x, y, c, n) = input.index(sx, sy, c, n);
                 }
             }
         }
@@ -56,8 +80,11 @@ void scale_to_unit(sd::Tensor<float>& tensor) {
 // centre on the way down (src = floor((i + 0.5) * 4) = 4i + 2), not the top-left corner, so each
 // 4x4 block ends up filled with its own centre pixel.
 void nearest_block_quantize(sd_image_t& image, int block) {
-    const uint32_t w = image.width / block * block;
-    const uint32_t h = image.height / block * block;
+    // center_crop_to_multiple ran with the same multiple, so the size is exact and no edge pixels
+    // can be left un-quantized.
+    GGML_ASSERT(image.width % block == 0 && image.height % block == 0);
+    const uint32_t w = image.width;
+    const uint32_t h = image.height;
     const uint32_t c = image.channel;
     for (uint32_t by = 0; by < h; by += block) {
         for (uint32_t bx = 0; bx < w; bx += block) {
