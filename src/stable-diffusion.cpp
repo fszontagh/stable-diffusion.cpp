@@ -106,6 +106,7 @@ const char* model_version_to_str[] = {
     "SeFi-Image",
     "Krea2",
     "ESRGAN",
+    "Pixelization",
 };
 
 const char* sampling_methods_str[] = {
