@@ -33,6 +33,7 @@ const char* const modes_str[] = {
     "vid_gen",
     "convert",
     "upscale",
+    "pixelize",
     "metadata",
 };
 
@@ -465,6 +466,17 @@ ArgOptions SDContextParams::get_options() {
          0,
          &esrgan_path},
         {"",
+         "--pixelization-model",
+         "path to pixelization model.",
+         0,
+         &pixelization_path},
+        {"",
+         "--pixelization-ref",
+         "path to a pixel-art reference image defining the style "
+         "(default: the style code stored in the model)",
+         0,
+         &pixelization_ref_path},
+        {"",
          "--backend",
          "runtime backend assignment, e.g. cpu or clip=cpu,vae=cuda0,diffusion=vulkan0",
          (int)',',
@@ -724,7 +736,7 @@ bool SDContextParams::validate(SDMode mode) {
             LOG_ERROR("error: convert mode needs at least one model input path\n");
             return false;
         }
-    } else if (mode != UPSCALE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
+    } else if (mode != UPSCALE && mode != PIXELIZE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
         LOG_ERROR("error: the following arguments are required: model_path/diffusion_model\n");
         return false;
     }
@@ -732,6 +744,13 @@ bool SDContextParams::validate(SDMode mode) {
     if (mode == UPSCALE) {
         if (esrgan_path.length() == 0) {
             LOG_ERROR("error: upscale mode needs an upscaler model (--upscale-model)\n");
+            return false;
+        }
+    }
+
+    if (mode == PIXELIZE) {
+        if (pixelization_path.length() == 0) {
+            LOG_ERROR("error: pixelize mode needs a pixelization model (--pixelization-model)\n");
             return false;
         }
     }
@@ -1028,6 +1047,10 @@ ArgOptions SDGenerationParams::get_options() {
          "--upscale-tile-size",
          "tile size for ESRGAN upscaling (default: 128)",
          &upscale_tile_size},
+        {"",
+         "--pixelization-tile-size",
+         "tile size for pixelization, 0 to process the whole image (default: 0)",
+         &pixelization_tile_size},
         {"",
          "--hires-width",
          "highres fix target width, 0 to use --hires-scale (default: 0)",
@@ -2350,6 +2373,17 @@ bool SDGenerationParams::validate(SDMode mode) {
     if (mode == UPSCALE) {
         if (init_image_path.length() == 0) {
             LOG_ERROR("error: upscale mode needs an init image (--init-img)\n");
+            return false;
+        }
+    }
+
+    if (mode == PIXELIZE) {
+        if (init_image_path.length() == 0) {
+            LOG_ERROR("error: pixelize mode needs an init image (--init-img)\n");
+            return false;
+        }
+        if (pixelization_tile_size < 0) {
+            LOG_ERROR("error: pixelization tile size must not be negative");
             return false;
         }
     }

@@ -783,7 +783,7 @@ int main(int argc, const char* argv[]) {
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
 
-    if (cli_params.mode == UPSCALE) {
+    if (cli_params.mode == UPSCALE || cli_params.mode == PIXELIZE) {
         num_results = 1;
         results.push_back(gen_params.init_image.release());
     } else {
@@ -827,6 +827,46 @@ int main(int argc, const char* argv[]) {
         if (!results) {
             LOG_ERROR("generate failed");
             return 1;
+        }
+    }
+
+    if (ctx_params.pixelization_path.size() > 0) {
+        SDImageOwner pixelization_ref;
+        if (ctx_params.pixelization_ref_path.size() > 0 &&
+            !load_sd_image_from_file(pixelization_ref.put(), ctx_params.pixelization_ref_path.c_str())) {
+            LOG_ERROR("load image from '%s' failed", ctx_params.pixelization_ref_path.c_str());
+            return 1;
+        }
+
+        PixelizerCtxPtr pixelizer_ctx(new_pixelizer_ctx(ctx_params.pixelization_path.c_str(),
+                                                        pixelization_ref.get(),
+                                                        ctx_params.diffusion_conv_direct,
+                                                        ctx_params.n_threads,
+                                                        gen_params.pixelization_tile_size,
+                                                        sd_ctx_params.backend,
+                                                        sd_ctx_params.params_backend));
+        if (pixelizer_ctx == nullptr) {
+            LOG_ERROR("new_pixelizer_ctx failed");
+            return 1;
+        }
+        for (int i = 0; i < num_results; i++) {
+            if (results[i].data == nullptr) {
+                continue;
+            }
+            SDImageOwner current_image(results[i]);
+            results[i] = {0, 0, 0, nullptr};
+
+            sd_image_t* pixelized_images = nullptr;
+            int pixelized_count          = 0;
+            if (!pixelize(pixelizer_ctx.get(), current_image.get(), &pixelized_images, &pixelized_count) ||
+                pixelized_count <= 0 || pixelized_images[0].data == nullptr) {
+                free_sd_images(pixelized_images, pixelized_count);
+                LOG_ERROR("pixelize failed");
+                return 1;
+            }
+            results[i]           = pixelized_images[0];
+            pixelized_images[0]  = {0, 0, 0, nullptr};
+            free_sd_images(pixelized_images, pixelized_count);
         }
     }
 

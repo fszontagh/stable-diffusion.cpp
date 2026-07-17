@@ -16,13 +16,14 @@
 #define BOOL_STR(b) ((b) ? "true" : "false")
 
 extern const char* const modes_str[];
-#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale, metadata"
+#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale, pixelize, metadata"
 
 enum SDMode {
     IMG_GEN,
     VID_GEN,
     CONVERT,
     UPSCALE,
+    PIXELIZE,
     METADATA,
     MODE_COUNT
 };
@@ -131,6 +132,8 @@ struct SDContextParams {
     std::string audio_vae_path;
     std::string taesd_path;
     std::string esrgan_path;
+    std::string pixelization_path;
+    std::string pixelization_ref_path;
     std::string control_net_path;
     std::string embedding_dir;
     std::string photo_maker_path;
@@ -236,6 +239,10 @@ struct SDGenerationParams {
 
     int upscale_repeats   = 1;
     int upscale_tile_size = 128;
+
+    // 0 processes the whole image at once. Instance norm reduces over the whole spatial extent,
+    // so tiles do not reproduce the untiled result.
+    int pixelization_tile_size = 0;
 
     bool circular   = false;
     bool circular_x = false;

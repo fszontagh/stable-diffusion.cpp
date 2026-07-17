@@ -1210,6 +1210,11 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
     if (version == VERSION_ESRGAN) {
         return convert_esrgan_tensor_name(std::move(name));
     }
+    // The convert script already emits names matching the block tree, so no renaming is needed.
+    // The branch exists to keep the generic SD/LoRA rules below from rewriting them.
+    if (version == VERSION_PIXELIZATION) {
+        return name;
+    }
 
     bool is_lora                             = false;
     bool is_lycoris_underline                = false;

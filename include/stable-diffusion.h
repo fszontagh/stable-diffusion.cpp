@@ -504,6 +504,24 @@ SD_API bool upscale(upscaler_ctx_t* upscaler_ctx,
 
 SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
 
+typedef struct pixelizer_ctx_t pixelizer_ctx_t;
+
+// ref_image selects the pixel-art style. Leave ref_image.data NULL to use the default style code
+// stored in the model file, which also skips the style encoder entirely.
+SD_API pixelizer_ctx_t* new_pixelizer_ctx(const char* model_path,
+                                          sd_image_t ref_image,
+                                          bool direct,
+                                          int n_threads,
+                                          int tile_size,
+                                          const char* backend,
+                                          const char* params_backend);
+SD_API void free_pixelizer_ctx(pixelizer_ctx_t* pixelizer_ctx);
+
+SD_API bool pixelize(pixelizer_ctx_t* pixelizer_ctx,
+                     sd_image_t input_image,
+                     sd_image_t** images_out,
+                     int* num_images_out);
+
 SD_API bool convert(const char* input_path,
                     const char* vae_path,
                     const char* output_path,
