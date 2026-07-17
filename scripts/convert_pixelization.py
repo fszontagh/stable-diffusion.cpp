@@ -39,7 +39,8 @@ def build_style_code(px_dir, g_state):
         ref = process(greyscale(Image.open("reference.png")))
     with torch.no_grad():
         code = G.MLP(G.PBEnc(ref)).flatten()
-    code = code / code.abs().max()  # exact: demodulation is scale-invariant; see spec 2.2
+    # Must stay RAW: normalizing shrinks demodulation's sum(w*code)^2, making
+    # the +1e-8 eps non-negligible and breaking scale invariance; see spec 2.2.
     return code.numpy().astype(np.float32)
 
 
@@ -88,9 +89,10 @@ def self_test(gguf_path):
     assert "default_style_code" in names, "default_style_code missing"
     code = next(t for t in r.tensors if t.name == "default_style_code")
     assert code.data.shape == (2048,), f"expected [2048], got {code.data.shape}"
+    assert code.data.dtype == np.float32, f"code must be F32, got {code.data.dtype}"
     absmax = abs(code.data).max()
-    assert absmax <= 1.0 + 1e-6, f"code must be normalized, absmax={absmax} (F16 overflows at 65504)"
-    assert absmax > 0.99, f"code should be normalized to absmax==1, got {absmax}"
+    # Raw, NOT normalized: normalizing breaks demodulation's eps assumption; see spec 2.2
+    assert absmax > 1e6, f"code must be RAW (expect ~8.4e8), got absmax={absmax} -- did someone normalize it?"
 
     for req in [
         "c2p.rgb_enc.",
@@ -104,7 +106,7 @@ def self_test(gguf_path):
     ]:
         assert any(n.startswith(req) for n in names), f"missing tensors under {req}"
 
-    print(f"self-test PASS: {len(names)} tensors, code absmax={absmax:.6f}")
+    print(f"self-test PASS: {len(names)} tensors, code absmax={absmax:.4e}")
 
 
 if __name__ == "__main__":
