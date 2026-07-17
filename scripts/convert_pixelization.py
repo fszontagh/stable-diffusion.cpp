@@ -109,7 +109,16 @@ def self_test(gguf_path):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--models", default="/data/SD_MODELS/pixelization")
+    p.add_argument(
+        "--models",
+        required=False,
+        help=(
+            "Directory holding 160_net_G_A.pth, alias_net.pth, and "
+            "pixelart_vgg19.pth (downloadable from the Google Drive links in "
+            "the upstream arenasys/pixelization_inference README). Required "
+            "unless --self-test is used."
+        ),
+    )
     p.add_argument(
         "--px-dir",
         required=False,
@@ -125,6 +134,7 @@ if __name__ == "__main__":
     if a.self_test:
         self_test(a.self_test)
     else:
-        if not a.px_dir:
-            p.error("the following arguments are required: --px-dir")
+        missing = [name for name, val in (("--px-dir", a.px_dir), ("--models", a.models)) if not val]
+        if missing:
+            p.error(f"the following arguments are required: {', '.join(missing)}")
         convert(a)
