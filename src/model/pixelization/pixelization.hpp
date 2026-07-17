@@ -55,6 +55,9 @@ __STATIC_INLINE__ void dump_stage(const std::string& name, const sd::Tensor<floa
 // Upstream's "LayerNorm" (basic_layer.py:338) reduces over the WHOLE tensor and applies
 // gamma/beta per channel, so the LayerNorm block (which reduces over ne[0] only) cannot be
 // reused. torch.std() is Bessel-corrected and the eps sits OUTSIDE the sqrt.
+//
+// Only the N==1 branch of upstream's implementation is ported; it reduces over every element,
+// which for N>1 would mix statistics across the batch instead of computing them per sample.
 class WholeTensorNorm : public UnaryBlock {
 protected:
     int64_t num_features;
@@ -71,6 +74,7 @@ public:
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         auto gc         = ctx->ggml_ctx;
+        GGML_ASSERT(x->ne[3] == 1);
         const int64_t n = ggml_nelements(x);
 
         ggml_tensor* mean = ggml_mean(gc, ggml_reshape_1d(gc, ggml_cont(gc, x), n));
@@ -96,11 +100,15 @@ public:
 // (k, k, in, out) with a bare .view(), which is a reindex, not a transpose. Modulation and
 // demodulation therefore act on the reinterpreted axes, and the buffer is permuted back into
 // conv layout afterwards. This is faithful to the trained weights; do not "simplify" it.
+//
+// Only the N==1 case is ported. Upstream fuses the batch into the conv via groups=batch, giving
+// each sample its own modulated weight; a single shared weight would be wrong for N>1.
 class ModulationConvBlock : public GGMLBlock {
 protected:
     int64_t in_c, out_c;
     int ksize;
     float wscale;
+    float eps;
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
         params["weight"] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ksize, ksize, in_c, out_c);
@@ -108,13 +116,14 @@ protected:
     }
 
 public:
-    ModulationConvBlock(int64_t in_c, int64_t out_c, int ksize)
-        : in_c(in_c), out_c(out_c), ksize(ksize) {
+    ModulationConvBlock(int64_t in_c, int64_t out_c, int ksize, float eps = 1e-8f)
+        : in_c(in_c), out_c(out_c), ksize(ksize), eps(eps) {
         wscale = 1.0f / std::sqrt((float)(ksize * ksize * in_c));
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* code) {
         auto gc = ctx->ggml_ctx;
+        GGML_ASSERT(x->ne[3] == 1);
 
         ggml_tensor* w = ggml_scale(gc, params["weight"], wscale);
         // [kw, kh, in, out] -> [out, in, kw', kh']; matches upstream's .view(1, k, k, in, out)
@@ -122,10 +131,10 @@ public:
         w = ggml_mul(gc, w, ggml_reshape_4d(gc, code, 1, in_c, 1, 1));
 
         // eps is INSIDE the sqrt here (basic_layer.py:35), unlike WholeTensorNorm. This is why
-        // the style code must stay raw: shrinking it shrinks this sum until 1e-8 matters.
+        // the style code must stay raw: shrinking it shrinks this sum until eps matters.
         ggml_tensor* sq   = ggml_reshape_2d(gc, ggml_cont(gc, ggml_sqr(gc, w)), out_c, ksize * ksize * in_c);
         ggml_tensor* norm = ggml_sum_rows(gc, ggml_cont(gc, ggml_transpose(gc, sq)));
-        norm              = ggml_sqrt(gc, ggml_scale_bias(gc, norm, 1.0f, 1e-8f));
+        norm              = ggml_sqrt(gc, ggml_scale_bias(gc, norm, 1.0f, eps));
         w                 = ggml_div(gc, w, ggml_reshape_4d(gc, norm, out_c, 1, 1, 1));
 
         w = ggml_cont(gc, ggml_permute(gc, w, 3, 2, 0, 1));
@@ -276,17 +285,24 @@ public:
 
 class RGBDecoderPx : public RGBDecoderTailPx {
 public:
+    // Each of the 8 modulated convs consumes its own dim-sized slice of the style code.
+    static constexpr int kModConvCount = 8;
+
     RGBDecoderPx(int64_t dim, int64_t out_dim)
-        : RGBDecoderTailPx(dim, out_dim) {
+        : RGBDecoderTailPx(dim, out_dim), mod_dim(dim) {
         blocks["mod_conv_1"] = std::shared_ptr<GGMLBlock>(new ModulationConvBlock(dim, dim, 3));
         blocks["mod_conv_2"] = std::shared_ptr<GGMLBlock>(new ModulationConvBlock(dim, dim, 3));
+    }
+
+    int64_t style_code_size() const {
+        return mod_dim * kModConvCount;
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* code) {
         auto gc = ctx->ggml_ctx;
 
         auto slice_code = [&](int i) {
-            return ggml_view_1d(gc, code, 256, (size_t)i * 256 * sizeof(float));
+            return ggml_view_1d(gc, code, mod_dim, (size_t)i * mod_dim * sizeof(float));
         };
         auto mc1 = std::dynamic_pointer_cast<ModulationConvBlock>(blocks["mod_conv_1"]);
         auto mc2 = std::dynamic_pointer_cast<ModulationConvBlock>(blocks["mod_conv_2"]);
@@ -296,11 +312,11 @@ public:
         // never saw gradients and hold N(0, 0.02) noise. Not a typo -- do not "fix".
         ggml_tensor* residual = x;
         x                     = mc1->forward(ctx, x, slice_code(0));
-        if (stage_dump_enabled_) {
+        if (stage_sink_ != nullptr) {
             capture(ctx, "mod1", x);
         }
         x = mc2->forward(ctx, x, slice_code(1));
-        if (stage_dump_enabled_) {
+        if (stage_sink_ != nullptr) {
             capture(ctx, "mod2", x);
         }
         x = ggml_add(gc, x, residual);
@@ -317,13 +333,12 @@ public:
 
     // Stage captures are owned by the runner, which reads them back after compute.
     void set_stage_sink(std::vector<std::pair<std::string, ggml_tensor*>>* sink) {
-        stage_sink_         = sink;
-        stage_dump_enabled_ = sink != nullptr;
+        stage_sink_ = sink;
     }
 
 protected:
+    int64_t mod_dim;
     std::vector<std::pair<std::string, ggml_tensor*>>* stage_sink_ = nullptr;
-    bool stage_dump_enabled_                                       = false;
 
     void capture(GGMLRunnerContext* ctx, const std::string& name, ggml_tensor* x) {
         stage_sink_->push_back({name, snapshot_tensor(ctx, x)});
@@ -348,6 +363,10 @@ public:
     C2PGenNet(int64_t in_dim, int64_t out_dim, int64_t dim, int n_downsample, int n_res) {
         blocks["rgb_enc"] = std::shared_ptr<GGMLBlock>(new RGBEncoderPx(in_dim, dim, n_downsample, n_res, "pixelization.c2p.enc"));
         blocks["rgb_dec"] = std::shared_ptr<GGMLBlock>(new RGBDecoderPx(dim << n_downsample, out_dim));
+    }
+
+    int64_t style_code_size() {
+        return std::dynamic_pointer_cast<RGBDecoderPx>(blocks["rgb_dec"])->style_code_size();
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* code, std::vector<std::pair<std::string, ggml_tensor*>>* stage_sink) {
@@ -590,7 +609,7 @@ struct C2PGenRunner : public GGMLRunner {
     }
 
     ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor, const sd::Tensor<float>& code_tensor) {
-        constexpr int kGraphNodes = 1 << 16;  // 65k
+        constexpr int kGraphNodes = 1 << 16;
         ggml_cgraph* gf           = new_graph_custom(kGraphNodes);
         ggml_tensor* x            = make_input(x_tensor);
         ggml_tensor* code         = make_input(code_tensor);
@@ -608,7 +627,7 @@ struct C2PGenRunner : public GGMLRunner {
     sd::Tensor<float> compute(const int n_threads,
                               const sd::Tensor<float>& x,
                               const std::vector<float>& code) {
-        GGML_ASSERT(code.size() == 2048);
+        GGML_ASSERT((int64_t)code.size() == net->style_code_size());
         sd::Tensor<float> code_tensor({(int64_t)code.size()}, code);
         auto get_graph = [&]() -> ggml_cgraph* { return build_graph(x, code_tensor); };
         auto result    = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
@@ -641,7 +660,7 @@ struct AliasNetRunner : public GGMLRunner {
     }
 
     ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor) {
-        constexpr int kGraphNodes = 1 << 16;  // 65k
+        constexpr int kGraphNodes = 1 << 16;
         ggml_cgraph* gf           = new_graph_custom(kGraphNodes);
         ggml_tensor* x            = make_input(x_tensor);
 
