@@ -52,11 +52,16 @@ python scripts/convert_pixelization.py \
 ```
 
 This reads all three `.pth` files, drops the untrained/unreachable
-`mod_conv_3`..`mod_conv_8` weights and the unused VGG19 classifier head, and
-bakes in a `default_style_code` tensor computed from the upstream
+`mod_conv_3`..`mod_conv_8` weights and the whole standalone VGG19 checkpoint,
+and bakes in a `default_style_code` tensor computed from the upstream
 `reference.png` image so that the converted file works standalone without a
-separate style reference. The resulting gguf is roughly 240 MB (all tensors
+separate style reference. The resulting gguf is roughly 170 MB (all tensors
 are stored as F32; nothing is quantized).
+
+`pixelart_vgg19.pth` is still required at convert time because `C2PGen`'s
+constructor loads it by relative path, but none of it reaches the gguf: the
+generator's `load_state_dict` overwrites every one of those tensors, and the
+style encoder reads the resulting `c2p.pb_enc.vgg.*` weights instead.
 
 Validate a converted file with:
 

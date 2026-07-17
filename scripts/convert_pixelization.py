@@ -30,6 +30,9 @@ def build_style_code(px_dir, g_state):
     with chdir(px_dir):
         # C2PGen's PixelBlockEncoder does torch.load('./pixelart_vgg19.pth')
         # at construction time; must run with cwd == px_dir (symlinked there).
+        # The file is a convert-time-only dependency: load_state_dict below
+        # overwrites every tensor it provides, so none of it reaches the gguf.
+        # The style encoder reads c2p.pb_enc.vgg.* instead.
         from models.c2pGen import C2PGen
 
         G = C2PGen(3, 3, 64, 2, 4, 256, 256, activ="relu", pad_type="reflect")
@@ -47,16 +50,13 @@ def build_style_code(px_dir, g_state):
 def convert(args):
     g = torch.load(f"{args.models}/160_net_G_A.pth", map_location="cpu", weights_only=True)
     alias = torch.load(f"{args.models}/alias_net.pth", map_location="cpu", weights_only=True)
-    vgg = torch.load(f"{args.models}/pixelart_vgg19.pth", map_location="cpu", weights_only=True)
 
     w = gguf.GGUFWriter(args.out, "pixelization")
     w.add_uint32("pixelization.arch_version", 1)
 
-    def emit(prefix, state, skip_dead=False, only=None):
+    def emit(prefix, state, skip_dead=False):
         for k, v in state.items():
             if skip_dead and any(d in k for d in DEAD):
-                continue
-            if only and not k.startswith(only):
                 continue
             name = prefix + k
             name = name.replace("RGBEnc.", "rgb_enc.").replace("RGBDec.", "rgb_dec.")
@@ -65,7 +65,6 @@ def convert(args):
 
     emit("c2p.", g, skip_dead=True)
     emit("alias.", alias)
-    emit("vgg.", vgg, only="features")  # classifier unused; see spec 3.2
     w.add_tensor("default_style_code", build_style_code(args.px_dir, g))
 
     w.write_header_to_file()
@@ -85,6 +84,10 @@ def self_test(gguf_path):
     dead = {n for n in names if any(f"mod_conv_{i}" in n for i in range(3, 9))}
     assert not dead, f"dead mod_conv_3..8 must be dropped, found: {dead}"
     assert not any("classifier" in n for n in names), "vgg classifier must be dropped"
+    # The standalone pixelart_vgg19 weights are dead: load_state_dict overwrites them at
+    # convert time, and the style encoder reads c2p.pb_enc.vgg.* instead; see spec 3.2.
+    standalone_vgg = {n for n in names if n.startswith("vgg.")}
+    assert not standalone_vgg, f"standalone vgg.* must be dropped, found: {standalone_vgg}"
 
     assert "default_style_code" in names, "default_style_code missing"
     code = next(t for t in r.tensors if t.name == "default_style_code")
@@ -99,10 +102,10 @@ def self_test(gguf_path):
         "c2p.rgb_dec.mod_conv_1.",
         "c2p.rgb_dec.mod_conv_2.",
         "c2p.pb_enc.",
+        "c2p.pb_enc.vgg.",
         "c2p.mlp.",
         "alias.rgb_enc.",
         "alias.rgb_dec.",
-        "vgg.features.",
     ]:
         assert any(n.startswith(req) for n in names), f"missing tensors under {req}"
 
