@@ -97,7 +97,7 @@ namespace pixelization {
 
             // ZERO padding: basic_layer.py:47 passes padding= to F.conv2d directly. Only ConvBlock
             // reflect-pads, despite the shared pad_type ctor argument.
-            x = ggml_ext_conv_2d(gc, x, w, nullptr, 1, 1, ksize / 2, ksize / 2, 1, 1);
+            x = ggml_ext_conv_2d(gc, x, w, nullptr, 1, 1, ksize / 2, ksize / 2, 1, 1, ctx->conv2d_direct_enabled);
             x = ggml_add(gc, x, ggml_reshape_4d(gc, params["bias"], 1, 1, out_c, 1));
             x = ggml_leaky_relu(gc, x, 0.2f, true);
             return ggml_scale(gc, x, std::sqrt(2.0f));
@@ -141,7 +141,7 @@ namespace pixelization {
             auto gc = ctx->ggml_ctx;
 
             x = ggml_ext_pad_reflect_2d(gc, x, padding, padding);
-            x = ggml_ext_conv_2d(gc, x, params["conv.weight"], params["conv.bias"], stride, stride, 0, 0, 1, 1);
+            x = ggml_ext_conv_2d(gc, x, params["conv.weight"], params["conv.bias"], stride, stride, 0, 0, 1, 1, ctx->conv2d_direct_enabled);
 
             if (norm == "in") {
                 x = ggml_group_norm(gc, x, (int)out_c, 1e-5f);
