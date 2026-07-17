@@ -51,8 +51,8 @@ struct PixelizerCtxDeleter {
 template <typename T>
 using FreeUniquePtr = std::unique_ptr<T, FreeDeleter>;
 
-using FilePtr        = std::unique_ptr<FILE, FileCloser>;
-using SDCtxPtr       = std::unique_ptr<sd_ctx_t, SDCtxDeleter>;
+using FilePtr         = std::unique_ptr<FILE, FileCloser>;
+using SDCtxPtr        = std::unique_ptr<sd_ctx_t, SDCtxDeleter>;
 using UpscalerCtxPtr  = std::unique_ptr<upscaler_ctx_t, UpscalerCtxDeleter>;
 using PixelizerCtxPtr = std::unique_ptr<pixelizer_ctx_t, PixelizerCtxDeleter>;
 

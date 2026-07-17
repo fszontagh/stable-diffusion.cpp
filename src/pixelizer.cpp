@@ -10,121 +10,121 @@
 
 namespace {
 
-constexpr int kSizeMultiple  = 4;
-constexpr int kPixelBlock    = 4;
-constexpr int64_t kStyleCode = 2048;
+    constexpr int kSizeMultiple  = 4;
+    constexpr int kPixelBlock    = 4;
+    constexpr int64_t kStyleCode = 2048;
 
-// Python's round() is round-half-to-even, so std::rint (default FE_TONEAREST) is the match here
-// and std::lround (half-away-from-zero) is not: it disagrees for e.g. 250 and 258.
-int64_t round_half_even_to_multiple(int64_t size, int multiple) {
-    return (int64_t)std::rint((double)size / multiple) * multiple;
-}
-
-// Python's // floors; C division truncates toward zero. The two disagree on the negative odd
-// offsets produced when the rounded size grows (any size 3 mod 4).
-int64_t floor_div2(int64_t value) {
-    return (int64_t)std::floor((double)value / 2.0);
-}
-
-// pixelization.py:52-67 crops to a multiple of 4 around the centre before normalizing. The rounded
-// size can exceed the source, in which case upstream hands PIL.crop out-of-bounds coordinates and
-// PIL silently pads with black rather than erroring; reads outside the source reproduce that by
-// leaving the zero-filled output untouched. Cropping happens on the [0,1] tensor before
-// scale_to_signed, so black is 0.0 here.
-sd::Tensor<float> center_crop_to_multiple(const sd::Tensor<float>& input, int multiple) {
-    const int64_t ow = input.shape()[0];
-    const int64_t oh = input.shape()[1];
-    const int64_t nw = round_half_even_to_multiple(ow, multiple);
-    const int64_t nh = round_half_even_to_multiple(oh, multiple);
-    if (nw == ow && nh == oh) {
-        return input;
+    // Python's round() is round-half-to-even, so std::rint (default FE_TONEAREST) is the match here
+    // and std::lround (half-away-from-zero) is not: it disagrees for e.g. 250 and 258.
+    int64_t round_half_even_to_multiple(int64_t size, int multiple) {
+        return (int64_t)std::rint((double)size / multiple) * multiple;
     }
-    const int64_t left = floor_div2(ow - nw);
-    const int64_t top  = floor_div2(oh - nh);
 
-    sd::Tensor<float> out = sd::zeros<float>({nw, nh, input.shape()[2], input.shape()[3]});
-    for (int64_t n = 0; n < out.shape()[3]; n++) {
-        for (int64_t c = 0; c < out.shape()[2]; c++) {
-            for (int64_t y = 0; y < nh; y++) {
-                const int64_t sy = top + y;
-                if (sy < 0 || sy >= oh) {
-                    continue;
-                }
-                for (int64_t x = 0; x < nw; x++) {
-                    const int64_t sx = left + x;
-                    if (sx < 0 || sx >= ow) {
+    // Python's // floors; C division truncates toward zero. The two disagree on the negative odd
+    // offsets produced when the rounded size grows (any size 3 mod 4).
+    int64_t floor_div2(int64_t value) {
+        return (int64_t)std::floor((double)value / 2.0);
+    }
+
+    // pixelization.py:52-67 crops to a multiple of 4 around the centre before normalizing. The rounded
+    // size can exceed the source, in which case upstream hands PIL.crop out-of-bounds coordinates and
+    // PIL silently pads with black rather than erroring; reads outside the source reproduce that by
+    // leaving the zero-filled output untouched. Cropping happens on the [0,1] tensor before
+    // scale_to_signed, so black is 0.0 here.
+    sd::Tensor<float> center_crop_to_multiple(const sd::Tensor<float>& input, int multiple) {
+        const int64_t ow = input.shape()[0];
+        const int64_t oh = input.shape()[1];
+        const int64_t nw = round_half_even_to_multiple(ow, multiple);
+        const int64_t nh = round_half_even_to_multiple(oh, multiple);
+        if (nw == ow && nh == oh) {
+            return input;
+        }
+        const int64_t left = floor_div2(ow - nw);
+        const int64_t top  = floor_div2(oh - nh);
+
+        sd::Tensor<float> out = sd::zeros<float>({nw, nh, input.shape()[2], input.shape()[3]});
+        for (int64_t n = 0; n < out.shape()[3]; n++) {
+            for (int64_t c = 0; c < out.shape()[2]; c++) {
+                for (int64_t y = 0; y < nh; y++) {
+                    const int64_t sy = top + y;
+                    if (sy < 0 || sy >= oh) {
                         continue;
                     }
-                    out.index(x, y, c, n) = input.index(sx, sy, c, n);
+                    for (int64_t x = 0; x < nw; x++) {
+                        const int64_t sx = left + x;
+                        if (sx < 0 || sx >= ow) {
+                            continue;
+                        }
+                        out.index(x, y, c, n) = input.index(sx, sy, c, n);
+                    }
                 }
             }
         }
+        return out;
     }
-    return out;
-}
 
-// transforms.Normalize((0.5,)*3, (0.5,)*3): [0,1] -> [-1,1], and its inverse.
-void scale_to_signed(sd::Tensor<float>& tensor) {
-    for (float& value : tensor.values()) {
-        value = value * 2.0f - 1.0f;
+    // transforms.Normalize((0.5,)*3, (0.5,)*3): [0,1] -> [-1,1], and its inverse.
+    void scale_to_signed(sd::Tensor<float>& tensor) {
+        for (float& value : tensor.values()) {
+            value = value * 2.0f - 1.0f;
+        }
     }
-}
 
-void scale_to_unit(sd::Tensor<float>& tensor) {
-    for (float& value : tensor.values()) {
-        value = (value + 1.0f) * 0.5f;
+    void scale_to_unit(sd::Tensor<float>& tensor) {
+        for (float& value : tensor.values()) {
+            value = (value + 1.0f) * 0.5f;
+        }
     }
-}
 
-// pixelization.py:74-75 downscales 4x then upscales 4x, both NEAREST. PIL samples the block
-// centre on the way down (src = floor((i + 0.5) * 4) = 4i + 2), not the top-left corner, so each
-// 4x4 block ends up filled with its own centre pixel.
-void nearest_block_quantize(sd_image_t& image, int block) {
-    // center_crop_to_multiple ran with the same multiple, so the size is exact and no edge pixels
-    // can be left un-quantized.
-    GGML_ASSERT(image.width % block == 0 && image.height % block == 0);
-    const uint32_t w = image.width;
-    const uint32_t h = image.height;
-    const uint32_t c = image.channel;
-    for (uint32_t by = 0; by < h; by += block) {
-        for (uint32_t bx = 0; bx < w; bx += block) {
-            const uint32_t sx = bx + block / 2;
-            const uint32_t sy = by + block / 2;
-            for (uint32_t y = by; y < by + block; y++) {
-                for (uint32_t x = bx; x < bx + block; x++) {
-                    for (uint32_t ic = 0; ic < c; ic++) {
-                        image.data[(y * image.width + x) * c + ic] =
-                            image.data[(sy * image.width + sx) * c + ic];
+    // pixelization.py:74-75 downscales 4x then upscales 4x, both NEAREST. PIL samples the block
+    // centre on the way down (src = floor((i + 0.5) * 4) = 4i + 2), not the top-left corner, so each
+    // 4x4 block ends up filled with its own centre pixel.
+    void nearest_block_quantize(sd_image_t& image, int block) {
+        // center_crop_to_multiple ran with the same multiple, so the size is exact and no edge pixels
+        // can be left un-quantized.
+        GGML_ASSERT(image.width % block == 0 && image.height % block == 0);
+        const uint32_t w = image.width;
+        const uint32_t h = image.height;
+        const uint32_t c = image.channel;
+        for (uint32_t by = 0; by < h; by += block) {
+            for (uint32_t bx = 0; bx < w; bx += block) {
+                const uint32_t sx = bx + block / 2;
+                const uint32_t sy = by + block / 2;
+                for (uint32_t y = by; y < by + block; y++) {
+                    for (uint32_t x = bx; x < bx + block; x++) {
+                        for (uint32_t ic = 0; ic < c; ic++) {
+                            image.data[(y * image.width + x) * c + ic] =
+                                image.data[(sy * image.width + sx) * c + ic];
+                        }
                     }
                 }
             }
         }
     }
-}
 
-// pixelization.py:46 feeds the reference through convert('L') replicated across 3 channels.
-sd::Tensor<float> reference_to_greyscale_tensor(sd_image_t ref_image) {
-    sd::Tensor<float> rgb = sd_image_to_tensor(ref_image);
-    sd::Tensor<float> out = sd::zeros<float>({rgb.shape()[0], rgb.shape()[1], 3, 1});
-    for (int64_t y = 0; y < rgb.shape()[1]; y++) {
-        for (int64_t x = 0; x < rgb.shape()[0]; x++) {
-            float luma = 0.0f;
-            if (rgb.shape()[2] >= 3) {
-                // ITU-R 601-2 luma, matching PIL's convert('L').
-                luma = 299.0f / 1000.0f * rgb.index(x, y, 0, 0) +
-                       587.0f / 1000.0f * rgb.index(x, y, 1, 0) +
-                       114.0f / 1000.0f * rgb.index(x, y, 2, 0);
-                luma = std::floor(luma * 255.0f) / 255.0f;
-            } else {
-                luma = rgb.index(x, y, 0, 0);
-            }
-            for (int64_t c = 0; c < 3; c++) {
-                out.index(x, y, c, 0) = luma;
+    // pixelization.py:46 feeds the reference through convert('L') replicated across 3 channels.
+    sd::Tensor<float> reference_to_greyscale_tensor(sd_image_t ref_image) {
+        sd::Tensor<float> rgb = sd_image_to_tensor(ref_image);
+        sd::Tensor<float> out = sd::zeros<float>({rgb.shape()[0], rgb.shape()[1], 3, 1});
+        for (int64_t y = 0; y < rgb.shape()[1]; y++) {
+            for (int64_t x = 0; x < rgb.shape()[0]; x++) {
+                float luma = 0.0f;
+                if (rgb.shape()[2] >= 3) {
+                    // ITU-R 601-2 luma, matching PIL's convert('L').
+                    luma = 299.0f / 1000.0f * rgb.index(x, y, 0, 0) +
+                           587.0f / 1000.0f * rgb.index(x, y, 1, 0) +
+                           114.0f / 1000.0f * rgb.index(x, y, 2, 0);
+                    luma = std::floor(luma * 255.0f) / 255.0f;
+                } else {
+                    luma = rgb.index(x, y, 0, 0);
+                }
+                for (int64_t c = 0; c < 3; c++) {
+                    out.index(x, y, c, 0) = luma;
+                }
             }
         }
+        return out;
     }
-    return out;
-}
 
 }  // namespace
 
@@ -166,8 +166,8 @@ bool PixelizerGGML::load_style_code(sd_image_t ref_image) {
     }
 
     style_encoder = std::make_shared<pixelization::StyleEncoderRunner>(backend_manager.runtime_backend(SDBackendModule::PIXELIZATION),
-                                                                      model_loader.get_tensor_storage_map(),
-                                                                      model_manager);
+                                                                       model_loader.get_tensor_storage_map(),
+                                                                       model_manager);
     std::map<std::string, ggml_tensor*> tensors;
     style_encoder->get_param_tensors(tensors);
     if (!model_manager->register_param_tensors("PIXELIZATION_STYLE",

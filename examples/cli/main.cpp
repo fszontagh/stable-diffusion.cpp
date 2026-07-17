@@ -864,8 +864,8 @@ int main(int argc, const char* argv[]) {
                 LOG_ERROR("pixelize failed");
                 return 1;
             }
-            results[i]           = pixelized_images[0];
-            pixelized_images[0]  = {0, 0, 0, nullptr};
+            results[i]          = pixelized_images[0];
+            pixelized_images[0] = {0, 0, 0, nullptr};
             free_sd_images(pixelized_images, pixelized_count);
         }
     }
