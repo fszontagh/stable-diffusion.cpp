@@ -1,56 +1,12 @@
 #ifndef __PIXELIZATION_HPP__
 #define __PIXELIZATION_HPP__
 
-#include <cstdio>
-#include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "core/ggml_extend.hpp"
 
 namespace pixelization {
-
-    // Stage dumps for the PyTorch parity harness. Enabled only when SD_PIXELIZATION_DUMP
-    // names a directory; writes .npy in PyTorch [N, C, H, W] order.
-    __STATIC_INLINE__ const char* stage_dump_dir() {
-        return getenv("SD_PIXELIZATION_DUMP");
-    }
-
-    // Copy into a dedicated output tensor so the allocator cannot reuse the buffer before the
-    // stage is read back, mirroring GGMLRunnerContext::capture_tensor.
-    __STATIC_INLINE__ ggml_tensor* snapshot_tensor(GGMLRunnerContext* ctx, ggml_tensor* x) {
-        ggml_tensor* snapshot = ggml_cont(ctx->ggml_ctx, x);
-        snapshot              = ggml_cpy(ctx->ggml_ctx, snapshot, ggml_dup_tensor(ctx->ggml_ctx, snapshot));
-        ggml_set_output(snapshot);
-        return snapshot;
-    }
-
-    __STATIC_INLINE__ void dump_stage(const std::string& name, const sd::Tensor<float>& tensor) {
-        const char* dir = stage_dump_dir();
-        if (dir == nullptr || tensor.empty()) {
-            return;
-        }
-        FILE* f = fopen((std::string(dir) + "/" + name + ".npy").c_str(), "wb");
-        if (f == nullptr) {
-            LOG_WARN("pixelization: cannot open stage dump for '%s'", name.c_str());
-            return;
-        }
-        std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (";
-        for (size_t i = tensor.shape().size(); i > 0; i--) {
-            header += std::to_string(tensor.shape()[i - 1]) + ",";
-        }
-        header += "), }";
-        while ((10 + header.size() + 1) % 64 != 0) {
-            header += ' ';
-        }
-        header += '\n';
-        const uint16_t header_len = (uint16_t)header.size();
-        fwrite("\x93NUMPY\x01\x00", 1, 8, f);
-        fwrite(&header_len, 2, 1, f);
-        fwrite(header.data(), 1, header.size(), f);
-        fwrite(tensor.data(), sizeof(float), tensor.numel(), f);
-        fclose(f);
-    }
 
     // Upstream's "LayerNorm" (basic_layer.py:338) reduces over the WHOLE tensor and applies
     // gamma/beta per channel, so the LayerNorm block (which reduces over ne[0] only) cannot be
@@ -312,14 +268,8 @@ namespace pixelization {
             // never saw gradients and hold N(0, 0.02) noise. Not a typo -- do not "fix".
             ggml_tensor* residual = x;
             x                     = mc1->forward(ctx, x, slice_code(0));
-            if (stage_sink_ != nullptr) {
-                capture(ctx, "mod1", x);
-            }
-            x = mc2->forward(ctx, x, slice_code(1));
-            if (stage_sink_ != nullptr) {
-                capture(ctx, "mod2", x);
-            }
-            x = ggml_add(gc, x, residual);
+            x                     = mc2->forward(ctx, x, slice_code(1));
+            x                     = ggml_add(gc, x, residual);
             sd::ggml_graph_cut::mark_graph_cut(x, "pixelization.c2p.dec.mod.0", "x");
             for (int pair = 1; pair < 4; pair++) {
                 residual = x;
@@ -331,18 +281,8 @@ namespace pixelization {
             return forward_tail(ctx, x);
         }
 
-        // Stage captures are owned by the runner, which reads them back after compute.
-        void set_stage_sink(std::vector<std::pair<std::string, ggml_tensor*>>* sink) {
-            stage_sink_ = sink;
-        }
-
     protected:
         int64_t mod_dim;
-        std::vector<std::pair<std::string, ggml_tensor*>>* stage_sink_ = nullptr;
-
-        void capture(GGMLRunnerContext* ctx, const std::string& name, ggml_tensor* x) {
-            stage_sink_->push_back({name, snapshot_tensor(ctx, x)});
-        }
     };
 
     class AliasRGBDecoderPx : public RGBDecoderTailPx {
@@ -369,14 +309,9 @@ namespace pixelization {
             return std::dynamic_pointer_cast<RGBDecoderPx>(blocks["rgb_dec"])->style_code_size();
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* code, std::vector<std::pair<std::string, ggml_tensor*>>* stage_sink) {
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* code) {
             auto dec = std::dynamic_pointer_cast<RGBDecoderPx>(blocks["rgb_dec"]);
-            dec->set_stage_sink(stage_sink);
-
-            x = std::dynamic_pointer_cast<RGBEncoderPx>(blocks["rgb_enc"])->forward(ctx, x);
-            if (stage_sink != nullptr) {
-                stage_sink->push_back({"rgb_enc", snapshot_tensor(ctx, x)});
-            }
+            x        = std::dynamic_pointer_cast<RGBEncoderPx>(blocks["rgb_enc"])->forward(ctx, x);
             return dec->forward(ctx, x, code);
         }
     };
@@ -583,14 +518,12 @@ namespace pixelization {
                 return {};
             }
             std::vector<float> code(result.data(), result.data() + result.numel());
-            dump_stage("style_code", result);
             return code;
         }
     };
 
     struct C2PGenRunner : public GGMLRunner {
         std::unique_ptr<C2PGenNet> net;
-        std::vector<std::pair<std::string, ggml_tensor*>> stage_tensors;
 
         C2PGenRunner(ggml_backend_t backend,
                      const String2TensorStorage& tensor_storage_map      = {},
@@ -614,12 +547,8 @@ namespace pixelization {
             ggml_tensor* x            = make_input(x_tensor);
             ggml_tensor* code         = make_input(code_tensor);
 
-            stage_tensors.clear();
             auto runner_ctx  = get_context();
-            ggml_tensor* out = net->forward(&runner_ctx, x, code, stage_dump_dir() != nullptr ? &stage_tensors : nullptr);
-            for (const auto& stage : stage_tensors) {
-                ggml_build_forward_expand(gf, stage.second);
-            }
+            ggml_tensor* out = net->forward(&runner_ctx, x, code);
             ggml_build_forward_expand(gf, out);
             return gf;
         }
@@ -631,11 +560,6 @@ namespace pixelization {
             sd::Tensor<float> code_tensor({(int64_t)code.size()}, code);
             auto get_graph = [&]() -> ggml_cgraph* { return build_graph(x, code_tensor); };
             auto result    = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
-            for (const auto& stage : stage_tensors) {
-                // ggml_n_dims drops the trailing batch of 1, which the [N, C, H, W] dump needs back.
-                dump_stage(stage.first, restore_trailing_singleton_dims(sd::make_sd_tensor_from_ggml<float>(stage.second), 4));
-            }
-            dump_stage("dec_out", result);
             return result;
         }
     };
@@ -674,7 +598,6 @@ namespace pixelization {
                                   const sd::Tensor<float>& x) {
             auto get_graph = [&]() -> ggml_cgraph* { return build_graph(x); };
             auto result    = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
-            dump_stage("alias_out", result);
             return result;
         }
     };
