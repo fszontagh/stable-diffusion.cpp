@@ -21,6 +21,7 @@
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
 #include "generate.h"
+#include "serialize.h"
 #include "session.h"
 #include "session_params.h"
 #include "tokenize.h"
@@ -155,6 +156,27 @@ static bool dispatch(Session& sess, const std::string& line) {
             std::ofstream out(args[0]);
             for (const auto& h : sess.history) out << h << "\n";
             std::cout << "exported " << sess.history.size() << " commands to " << args[0] << "\n";
+        }
+    } else if (cmd == "export-cli") {
+        // Scope note: this always serializes the session's current effective
+        // params, not a specific point in `history`; a history-index
+        // selector is deferred.
+        bool full = false;
+        std::string file;
+        for (const auto& a : args) {
+            if (a == "--full") {
+                full = true;
+            } else {
+                file = a;
+            }
+        }
+        std::string s = serialize_to_cli(sess.cli, sess.ctx, sess.gen, full);
+        if (file.empty()) {
+            std::cout << s << "\n";
+        } else {
+            std::ofstream out(file);
+            out << s << "\n";
+            std::cout << "wrote " << file << "\n";
         }
     } else if (cmd == "run") {
         if (args.empty()) {

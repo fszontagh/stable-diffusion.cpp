@@ -8,6 +8,7 @@ add_executable(${TARGET}
     generate.cpp
     instrument.cpp
     main.cpp
+    serialize.cpp
     session.cpp
     session_params.cpp
     tokenize.cpp
@@ -64,3 +65,26 @@ if(SD_WEBM)
     target_link_libraries(sd-session-tests-params PRIVATE webm)
 endif()
 target_compile_features(sd-session-tests-params PUBLIC c_std_11 cxx_std_17)
+
+add_executable(sd-session-tests-serialize
+    ../common/cli_params.cpp
+    ../common/common.cpp
+    ../common/log.cpp
+    ../common/media_io.cpp
+    serialize.cpp
+    tests/test_serialize.cpp
+)
+target_include_directories(sd-session-tests-serialize PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    "${PROJECT_SOURCE_DIR}/src"
+)
+target_link_libraries(sd-session-tests-serialize PRIVATE stable-diffusion zip ${CMAKE_THREAD_LIBS_INIT})
+if(SD_WEBP)
+    target_compile_definitions(sd-session-tests-serialize PRIVATE SD_USE_WEBP)
+    target_link_libraries(sd-session-tests-serialize PRIVATE webp libwebpmux)
+endif()
+if(SD_WEBM)
+    target_compile_definitions(sd-session-tests-serialize PRIVATE SD_USE_WEBM)
+    target_link_libraries(sd-session-tests-serialize PRIVATE webm)
+endif()
+target_compile_features(sd-session-tests-serialize PUBLIC c_std_11 cxx_std_17)
