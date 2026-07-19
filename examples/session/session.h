@@ -18,6 +18,7 @@ struct Session {
 
     bool loaded() const { return sd_ctx != nullptr; }
     bool context_changed() const;
+    std::string model_signature() const;
     bool load(std::string& err);
     void unload();
     bool ensure_ctx(std::string& err);

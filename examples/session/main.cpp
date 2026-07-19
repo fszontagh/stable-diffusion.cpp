@@ -36,6 +36,7 @@ static void print_help() {
         "commands:\n"
         "  load [flags]          create context from current params\n"
         "  unload                free context, keep params\n"
+        "  reset                 clear all params to defaults, unload context\n"
         "  set [flags]           change params without generating\n"
         "  gen [flags]           generate with current params\n"
         "  swap [flags]          free + recreate context\n"
@@ -97,11 +98,23 @@ static bool dispatch(Session& sess, const std::string& line) {
         sess.unload();
         std::cout << "unloaded\n";
         sess.history.push_back(line);
+    } else if (cmd == "reset") {
+        sess.unload();
+        sess.cli = SDCliParams{};
+        sess.ctx = SDContextParams{};
+        sess.gen = SDGenerationParams{};
+        std::cout << "reset: params cleared to defaults, context unloaded\n";
+        sess.history.push_back(line);
     } else if (cmd == "swap") {
         std::string err;
+        bool was_loaded          = sess.loaded();
+        std::string model_before = sess.model_signature();
         if (!apply_flags(args, sess.cli, sess.ctx, sess.gen, err)) {
             std::cout << "error: " << err << "\n";
             return true;
+        }
+        if (was_loaded && sess.model_signature() != model_before) {
+            std::cout << "warning: model changed; freeing the previous model and reloading\n";
         }
         sess.unload();
         if (!sess.load(err)) {
@@ -147,9 +160,13 @@ static bool dispatch(Session& sess, const std::string& line) {
         }
     } else if (cmd == "set") {
         std::string err;
+        std::string model_before = sess.model_signature();
         if (!apply_flags(args, sess.cli, sess.ctx, sess.gen, err)) {
             std::cout << "error: " << err << "\n";
             return true;
+        }
+        if (sess.loaded() && sess.model_signature() != model_before) {
+            std::cout << "warning: model changed; the loaded context will be freed and reloaded on next gen\n";
         }
         std::cout << "set ok" << (sess.loaded() && sess.context_changed() ? " (ctx will rebuild on next gen)" : "") << "\n";
         sess.history.push_back(line);
