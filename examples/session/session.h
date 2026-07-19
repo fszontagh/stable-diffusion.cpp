@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include "common/cli_params.h"
 #include "common/common.h"
 #include "common/resource_owners.hpp"
@@ -13,6 +14,7 @@ struct Session {
     std::string loaded_ctx_signature;
     bool sticky = true;
     Stats stats;
+    std::vector<std::string> history;
 
     bool loaded() const { return sd_ctx != nullptr; }
     bool context_changed() const;
