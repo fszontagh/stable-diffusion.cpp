@@ -82,6 +82,10 @@ std::string serialize_to_cli(const SDCliParams& cli,
     std::string out = "sd-cli";
     std::set<const void*> seen_targets;
 
+    if (full || cli.mode != IMG_GEN) {
+        out += " --mode " + std::string(modes_str[cli.mode]);
+    }
+
     SDCliParams def_cli;
     ArgOptions cur_cli_opts = const_cast<SDCliParams&>(cli).get_options();
     ArgOptions def_cli_opts = def_cli.get_options();
@@ -146,6 +150,29 @@ std::string serialize_to_cli(const SDCliParams& cli,
             out += " --ref-image " + quote_if_needed(path);
         }
     }
+
+    // sample_method / scheduler are ManualOptions (no target pointer), but
+    // they directly change generated pixels, so unlike the other
+    // ManualOptions below they get an explicit round-trip via the public
+    // reverse-mapping helpers instead of just a warning. COUNT means
+    // "unset/model-default"; there is no CLI spelling for that, so it is
+    // never emitted, even in full mode.
+    if (gen.sample_params.sample_method != SAMPLE_METHOD_COUNT) {
+        out += " --sampling-method " + std::string(sd_sample_method_name(gen.sample_params.sample_method));
+    }
+    if (gen.sample_params.scheduler != SCHEDULER_COUNT) {
+        out += " --scheduler " + std::string(sd_scheduler_name(gen.sample_params.scheduler));
+    }
+
+    // Remaining ManualOptions (no target pointer, no output-critical enum
+    // reverse-mapping) are not round-tripped by this serializer. Warn
+    // instead of silently dropping session state.
+    out += "\n# note: not serialized (re-add manually if used): "
+           "--skip-layers --high-noise-skip-layers --high-noise-sampling-method "
+           "--cache-mode --cache-option --scm-mask --scm-policy "
+           "--rng --sampler-rng --prediction --lora-apply-mode --type "
+           "--vae-tile-size --vae-relative-tile-size "
+           "--prompt-file --negative-prompt-file --hires-sigmas";
 
     return out;
 }

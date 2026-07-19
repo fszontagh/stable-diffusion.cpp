@@ -23,5 +23,18 @@ int main() {
 
     std::string full = serialize_to_cli(cli, ctx, gen, /*full=*/true);
     CHECK(full.size() > s.size());  // full emits strictly more
+
+    // ManualOptions this serializer does not round-trip must be flagged,
+    // not silently dropped.
+    CHECK(s.find("# note:") != std::string::npos);
+
+    // vid_gen (or any non-default mode) must round-trip via --mode; without
+    // it the exported command would silently re-run as img_gen.
+    SDCliParams vid_cli;
+    vid_cli.mode = VID_GEN;
+    std::string vid_s = serialize_to_cli(vid_cli, ctx, gen, /*full=*/false);
+    CHECK(vid_s.find("--mode") != std::string::npos);
+    CHECK(vid_s.find(modes_str[VID_GEN]) != std::string::npos);
+
     return 0;
 }
