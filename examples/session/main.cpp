@@ -106,6 +106,14 @@ static bool run_repl(std::istream& in, bool interactive) {
                 continue;
             }
             std::cout << "gen ok -> session_out_" << idx << ".png (seed now " << sess.gen.seed << ")\n";
+        } else if (cmd == "mode") {
+            if (args.size() == 1 && args[0] == "sticky") { sess.sticky = true; std::cout << "mode sticky\n"; }
+            else if (args.size() == 1 && args[0] == "explicit") { sess.sticky = false; std::cout << "mode explicit\n"; }
+            else { std::cout << "usage: mode sticky|explicit\n"; }
+        } else if (cmd == "set") {
+            std::string err;
+            if (!apply_flags(args, sess.cli, sess.ctx, sess.gen, err)) { std::cout << "error: " << err << "\n"; continue; }
+            std::cout << "set ok" << (sess.loaded() && sess.context_changed() ? " (ctx will rebuild on next gen)" : "") << "\n";
         } else {
             std::cout << "unknown command: " << cmd << " (try 'help')\n";
         }
