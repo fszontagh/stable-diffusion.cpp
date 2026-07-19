@@ -7,6 +7,8 @@
 #include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+#include "session.h"
+#include "session_params.h"
 #include "tokenize.h"
 
 static void print_help() {
@@ -35,6 +37,7 @@ int main(int argc, const char** argv) {
 }
 
 static bool run_repl(std::istream& in, bool interactive) {
+    Session sess;
     std::string line;
     while (true) {
         if (interactive) {
@@ -48,10 +51,41 @@ static bool run_repl(std::istream& in, bool interactive) {
             continue;
         }
         const std::string& cmd = tokens[0];
+        std::vector<std::string> args(tokens.begin() + 1, tokens.end());
         if (cmd == "quit" || cmd == "exit") {
             break;
         } else if (cmd == "help") {
             print_help();
+        } else if (cmd == "load") {
+            std::string err;
+            if (sess.loaded()) {
+                std::cout << "already loaded; use swap\n";
+                continue;
+            }
+            if (!apply_flags(args, sess.cli, sess.ctx, sess.gen, err)) {
+                std::cout << "error: " << err << "\n";
+                continue;
+            }
+            if (!sess.load(err)) {
+                std::cout << "error: " << err << "\n";
+                continue;
+            }
+            std::cout << "loaded\n";
+        } else if (cmd == "unload") {
+            sess.unload();
+            std::cout << "unloaded\n";
+        } else if (cmd == "swap") {
+            std::string err;
+            if (!apply_flags(args, sess.cli, sess.ctx, sess.gen, err)) {
+                std::cout << "error: " << err << "\n";
+                continue;
+            }
+            sess.unload();
+            if (!sess.load(err)) {
+                std::cout << "error: " << err << "\n";
+                continue;
+            }
+            std::cout << "swapped\n";
         } else {
             std::cout << "unknown command: " << cmd << " (try 'help')\n";
         }

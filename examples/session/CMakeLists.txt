@@ -1,10 +1,13 @@
 set(TARGET sd-session)
 
 add_executable(${TARGET}
+    ../common/cli_params.cpp
     ../common/common.cpp
     ../common/log.cpp
     ../common/media_io.cpp
     main.cpp
+    session.cpp
+    session_params.cpp
     tokenize.cpp
 )
 if(APPLE)
