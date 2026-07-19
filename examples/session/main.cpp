@@ -7,6 +7,7 @@
 #include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+#include "tokenize.h"
 
 static void print_help() {
     std::cout <<
@@ -42,12 +43,11 @@ static bool run_repl(std::istream& in, bool interactive) {
         if (!std::getline(in, line)) {
             break;  // EOF
         }
-        std::istringstream ls(line);
-        std::string cmd;
-        ls >> cmd;
-        if (cmd.empty() || cmd[0] == '#') {
+        std::vector<std::string> tokens = tokenize_line(line);
+        if (tokens.empty() || tokens[0][0] == '#') {
             continue;
         }
+        const std::string& cmd = tokens[0];
         if (cmd == "quit" || cmd == "exit") {
             break;
         } else if (cmd == "help") {

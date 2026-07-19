@@ -5,6 +5,7 @@ add_executable(${TARGET}
     ../common/log.cpp
     ../common/media_io.cpp
     main.cpp
+    tokenize.cpp
 )
 if(APPLE)
     sd_set_macos_rpaths(${TARGET})
@@ -24,3 +25,6 @@ if(SD_WEBM)
     target_link_libraries(${TARGET} PRIVATE webm)
 endif()
 target_compile_features(${TARGET} PUBLIC c_std_11 cxx_std_17)
+
+add_executable(sd-session-tests tests/test_tokenize.cpp tokenize.cpp)
+target_include_directories(sd-session-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
