@@ -10,7 +10,6 @@
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #else
-#include <cstring>
 #include <unistd.h>
 #endif
 

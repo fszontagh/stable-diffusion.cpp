@@ -36,5 +36,24 @@ int main() {
     CHECK(!bad_mode);
     CHECK(!err.empty());
 
+    // A malformed numeric flag value must not terminate the process (the
+    // underlying parser can throw std::invalid_argument/out_of_range from
+    // std::stoi/std::stof); apply_flags must catch it and report an error.
+    // std::stoi() parses a leading numeric prefix and ignores trailing
+    // garbage (e.g. "8x" -> 8), so it does not throw. Use a value with no
+    // leading digits to force std::invalid_argument out of std::stoi.
+    err.clear();
+    bool bad_numeric = apply_flags({"--steps", "abc"}, cli, ctx, gen, err);
+    CHECK(!bad_numeric);
+    CHECK(!err.empty());
+
+    // A line that mutates state before failing later must not leave the
+    // caller's structs partially updated (all-or-nothing semantics).
+    gen.prompt = "keepme";
+    err.clear();
+    bool partial_fail = apply_flags({"-p", "changed", "--steps", "abc"}, cli, ctx, gen, err);
+    CHECK(!partial_fail);
+    CHECK(gen.prompt == "keepme");
+
     return 0;
 }

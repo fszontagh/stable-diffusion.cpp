@@ -55,13 +55,13 @@ bool run_gen(Session& sess, const std::vector<std::string>& args,
     auto t_end          = std::chrono::steady_clock::now();
     out_timing.after    = sample_mem();
     out_timing.seconds  = std::chrono::duration<double>(t_end - t_start).count();
-    sess.stats.record(out_timing.seconds, out_timing.before, out_timing.after, get_vram_total_bytes());
 
     if (!ok || out == nullptr || n <= 0) {
         free_sd_images(out, n);
         err = "generate failed";
         return false;
     }
+    sess.stats.record(out_timing.seconds, out_timing.before, out_timing.after, get_vram_total_bytes());
     for (int i = 0; i < n; ++i) {
         if (out[i].data) {
             save_image(out[i], g_out_counter);

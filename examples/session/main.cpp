@@ -118,7 +118,11 @@ static bool dispatch(Session& sess, const std::string& line) {
             std::cout << "error: " << err << "\n";
             return true;
         }
-        std::cout << "gen ok -> session_out_" << idx << ".png (seed now " << sess.gen.seed << ")\n";
+        if (idx >= 0) {
+            std::cout << "gen ok -> session_out_" << idx << ".png (seed now " << sess.gen.seed << ")\n";
+        } else {
+            std::cout << "gen ok (no image saved) (seed now " << sess.gen.seed << ")\n";
+        }
         std::cout << "gen #" << sess.stats.gens
                    << " seed=" << (sess.gen.seed - (sess.sticky ? 1 : 0))
                    << " " << timing.seconds << "s"
@@ -179,17 +183,23 @@ static bool dispatch(Session& sess, const std::string& line) {
             std::cout << "wrote " << file << "\n";
         }
     } else if (cmd == "run") {
+        static const int kMaxRunDepth = 32;
+        static int run_depth = 0;
         if (args.empty()) {
             std::cout << "usage: run <file>\n";
+        } else if (run_depth >= kMaxRunDepth) {
+            std::cout << "error: run depth limit (" << kMaxRunDepth << ") exceeded, refusing to open " << args[0] << "\n";
         } else {
             std::ifstream in(args[0]);
             if (!in) {
                 std::cout << "cannot open " << args[0] << "\n";
             } else {
+                ++run_depth;
                 std::string l;
                 while (std::getline(in, l)) {
                     if (!dispatch(sess, l)) break;
                 }
+                --run_depth;
             }
         }
     } else {
