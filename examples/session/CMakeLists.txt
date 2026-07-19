@@ -5,6 +5,7 @@ add_executable(${TARGET}
     ../common/common.cpp
     ../common/log.cpp
     ../common/media_io.cpp
+    generate.cpp
     main.cpp
     session.cpp
     session_params.cpp

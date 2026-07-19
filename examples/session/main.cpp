@@ -5,11 +5,18 @@
 
 #include "stable-diffusion.h"
 #include "common/common.h"
+#include "common/log.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+#include "generate.h"
 #include "session.h"
 #include "session_params.h"
 #include "tokenize.h"
+
+static void sd_session_log_cb(enum sd_log_level_t level, const char* log, void* data) {
+    (void)data;
+    log_print(level, log, log_verbose, log_color);
+}
 
 static void print_help() {
     std::cout <<
@@ -30,8 +37,13 @@ static void print_help() {
 static bool run_repl(std::istream& in, bool interactive);
 
 int main(int argc, const char** argv) {
-    (void)argc;
-    (void)argv;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-v" || arg == "--verbose") {
+            log_verbose = true;
+        }
+    }
+    sd_set_log_callback(sd_session_log_cb, nullptr);
     bool interactive = true;  // refined in Task 8 (detect piped stdin / script file)
     return run_repl(std::cin, interactive) ? 0 : 1;
 }
@@ -86,6 +98,14 @@ static bool run_repl(std::istream& in, bool interactive) {
                 continue;
             }
             std::cout << "swapped\n";
+        } else if (cmd == "gen") {
+            std::string err;
+            int idx = -1;
+            if (!run_gen(sess, args, idx, err)) {
+                std::cout << "error: " << err << "\n";
+                continue;
+            }
+            std::cout << "gen ok -> session_out_" << idx << ".png (seed now " << sess.gen.seed << ")\n";
         } else {
             std::cout << "unknown command: " << cmd << " (try 'help')\n";
         }
