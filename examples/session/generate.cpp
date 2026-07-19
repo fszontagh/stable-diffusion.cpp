@@ -2,6 +2,7 @@
 #include "session_params.h"
 #include "common/media_io.h"
 #include "common/log.h"
+#include <chrono>
 #include <cstdio>
 
 static int g_out_counter = 0;
@@ -13,7 +14,7 @@ static bool save_image(const sd_image_t& img, int idx) {
 }
 
 bool run_gen(Session& sess, const std::vector<std::string>& args,
-             int& out_index, std::string& err) {
+             int& out_index, std::string& err, GenTiming& out_timing) {
     if (!sess.sticky) {
         // explicit mode: reset gen params to defaults before applying this line
         sess.gen = SDGenerationParams{};
@@ -39,6 +40,9 @@ bool run_gen(Session& sess, const std::vector<std::string>& args,
     sd_image_t* out = nullptr;
     int n           = 0;
     bool ok         = false;
+
+    out_timing.before  = sample_mem();
+    auto t_start        = std::chrono::steady_clock::now();
     if (sess.cli.mode == VID_GEN) {
         sd_vid_gen_params_t vp = sess.gen.to_sd_vid_gen_params_t();
         sd_audio_t* audio      = nullptr;
@@ -48,6 +52,11 @@ bool run_gen(Session& sess, const std::vector<std::string>& args,
         sd_img_gen_params_t ip = sess.gen.to_sd_img_gen_params_t();
         ok = generate_image(sess.sd_ctx.get(), &ip, &out, &n);
     }
+    auto t_end          = std::chrono::steady_clock::now();
+    out_timing.after    = sample_mem();
+    out_timing.seconds  = std::chrono::duration<double>(t_end - t_start).count();
+    sess.stats.record(out_timing.seconds, out_timing.before, out_timing.after, get_vram_total_bytes());
+
     if (!ok || out == nullptr || n <= 0) {
         free_sd_images(out, n);
         err = "generate failed";

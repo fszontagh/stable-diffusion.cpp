@@ -6,6 +6,7 @@ add_executable(${TARGET}
     ../common/log.cpp
     ../common/media_io.cpp
     generate.cpp
+    instrument.cpp
     main.cpp
     session.cpp
     session_params.cpp
@@ -32,6 +33,14 @@ target_compile_features(${TARGET} PUBLIC c_std_11 cxx_std_17)
 
 add_executable(sd-session-tests tests/test_tokenize.cpp tokenize.cpp)
 target_include_directories(sd-session-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(sd-session-tests-instrument tests/test_instrument.cpp instrument.cpp)
+target_include_directories(sd-session-tests-instrument PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${PROJECT_SOURCE_DIR}/src"
+)
+target_link_libraries(sd-session-tests-instrument PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(sd-session-tests-instrument PUBLIC c_std_11 cxx_std_17)
 
 add_executable(sd-session-tests-params
     ../common/cli_params.cpp

@@ -3,6 +3,7 @@
 #include "common/cli_params.h"
 #include "common/common.h"
 #include "common/resource_owners.hpp"
+#include "instrument.h"
 
 struct Session {
     SDCliParams cli;
@@ -11,6 +12,7 @@ struct Session {
     SDCtxPtr sd_ctx;
     std::string loaded_ctx_signature;
     bool sticky = true;
+    Stats stats;
 
     bool loaded() const { return sd_ctx != nullptr; }
     bool context_changed() const;

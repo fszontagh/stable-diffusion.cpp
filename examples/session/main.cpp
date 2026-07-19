@@ -101,11 +101,21 @@ static bool run_repl(std::istream& in, bool interactive) {
         } else if (cmd == "gen") {
             std::string err;
             int idx = -1;
-            if (!run_gen(sess, args, idx, err)) {
+            GenTiming timing;
+            if (!run_gen(sess, args, idx, err, timing)) {
                 std::cout << "error: " << err << "\n";
                 continue;
             }
             std::cout << "gen ok -> session_out_" << idx << ".png (seed now " << sess.gen.seed << ")\n";
+            std::cout << "gen #" << sess.stats.gens
+                       << " seed=" << (sess.gen.seed - (sess.sticky ? 1 : 0))
+                       << " " << timing.seconds << "s"
+                       << " | VRAM free " << (timing.before.vram_free / (1024 * 1024))
+                       << "->" << (timing.after.vram_free / (1024 * 1024)) << " MiB"
+                       << " | RSS " << (timing.before.rss / (1024 * 1024))
+                       << "->" << (timing.after.rss / (1024 * 1024)) << " MiB\n";
+        } else if (cmd == "stats") {
+            std::cout << sess.stats.format() << "\n";
         } else if (cmd == "mode") {
             if (args.size() == 1 && args[0] == "sticky") { sess.sticky = true; std::cout << "mode sticky\n"; }
             else if (args.size() == 1 && args[0] == "explicit") { sess.sticky = false; std::cout << "mode explicit\n"; }
