@@ -134,7 +134,7 @@ struct SDCliParams {
                 if (mode_found == -1) {
                     LOG_ERROR("error: invalid mode %s, must be one of [%s]\n",
                               mode_c_str, SD_ALL_MODES_STR);
-                    exit(1);
+                    return -1;
                 }
                 mode = (SDMode)mode_found;
             }

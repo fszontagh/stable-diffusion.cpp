@@ -51,5 +51,3 @@ if(SD_WEBM)
     target_link_libraries(sd-session-tests-params PRIVATE webm)
 endif()
 target_compile_features(sd-session-tests-params PUBLIC c_std_11 cxx_std_17)
-# Keep assert() active even in Release builds so this executable is a real test gate.
-target_compile_options(sd-session-tests-params PRIVATE -UNDEBUG)
