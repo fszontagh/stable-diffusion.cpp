@@ -1418,6 +1418,19 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         name = convert_qwen3_vl_vision_name(std::move(name));
     }
 
+    // JoyAI ships Qwen3-VL with the vision tower and the language model nested
+    // one level deeper than sd.cpp expects. Names are already HF-style, so only
+    // the infixes differ.
+    if (sd_version_is_joyai_image(version)) {
+        static const std::string joyai_vision_prefix = "text_encoders.llm.model.visual.";
+        static const std::string joyai_lm_prefix     = "text_encoders.llm.model.language_model.";
+        if (starts_with(name, joyai_vision_prefix)) {
+            name = "text_encoders.llm.visual." + name.substr(joyai_vision_prefix.size());
+        } else if (starts_with(name, joyai_lm_prefix)) {
+            name = "text_encoders.llm.model." + name.substr(joyai_lm_prefix.size());
+        }
+    }
+
     // diffusion model
     {
         bool matched = false;

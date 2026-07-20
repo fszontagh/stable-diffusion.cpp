@@ -200,6 +200,12 @@ namespace LLM {
                         config.vision.in_channels = tensor_storage.ne[2];
                         config.vision.hidden_size = tensor_storage.ne[3];
                     }
+                    // Non-split patch embed keeps the temporal extent on ne[2],
+                    // so in_channels is not separable here.
+                    if (contains(name, "visual.patch_embed.proj.weight")) {
+                        config.vision.patch_size  = static_cast<int>(tensor_storage.ne[0]);
+                        config.vision.hidden_size = tensor_storage.ne[3];
+                    }
                     if (contains(name, "visual.patch_embed.bias")) {
                         config.vision.hidden_size = tensor_storage.ne[0];
                     }

@@ -40,6 +40,7 @@
 #include "model/diffusion/mmdit.hpp"
 #include "model/diffusion/model.hpp"
 #include "model/diffusion/pid.hpp"
+#include "model/diffusion/joyai_image.hpp"
 #include "model/diffusion/qwen_image.hpp"
 #include "model/diffusion/unet.hpp"
 #include "model/diffusion/wan.hpp"
@@ -115,6 +116,7 @@ const char* model_version_to_str[] = {
     "Ideogram 4",
     "SeFi-Image",
     "Krea2",
+    "JoyAI Image Edit",
     "ESRGAN",
 };
 
@@ -1147,6 +1149,21 @@ public:
                                                                           version,
                                                                           model_manager,
                                                                           sd_ctx_params->model_args);
+            } else if (sd_version_is_joyai_image(version)) {
+                // TODO(#6): dedicated Qwen3-VL multimodal conditioner. Placeholder
+                // uses the shared LLM embedder path so the pipeline constructs.
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 true,
+                                                                 model_manager);
+                diffusion_model  = std::make_shared<JoyImage::JoyImageRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                             tensor_storage_map,
+                                                                             "model.diffusion_model",
+                                                                             version,
+                                                                             model_manager,
+                                                                             sd_ctx_params->model_args);
             } else if (sd_version_is_longcat(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -1648,6 +1665,7 @@ public:
                            sd_version_is_z_image(version) ||
                            sd_version_is_boogu_image(version) ||
                            sd_version_is_pid(version) ||
+                           sd_version_is_joyai_image(version) ||
                            sd_version_is_ideogram4(version)) {
                     pred_type = FLOW_PRED;
                     if (sd_version_is_wan(version)) {
@@ -1656,7 +1674,7 @@ public:
                         default_flow_shift = 7.f;
                     } else if (sd_version_is_ernie_image(version)) {
                         default_flow_shift = 4.f;
-                    } else if (sd_version_is_pid(version)) {
+                    } else if (sd_version_is_pid(version) || sd_version_is_joyai_image(version)) {
                         default_flow_shift = 1.5f;
                     } else if (sd_version_is_ideogram4(version)) {
                         default_flow_shift = 1.0f;
@@ -2416,7 +2434,9 @@ public:
         if (use_apg_guidance) {
             LOG_INFO("using Adaptive Projected Guidance (APG)");
         }
-        sd::guidance::ClassifierFreeGuidance classifier_free_guidance(cfg_scale, img_cfg_scale);
+        sd::guidance::ClassifierFreeGuidance classifier_free_guidance(cfg_scale,
+                                                                      img_cfg_scale,
+                                                                      sd_version_is_joyai_image(version));
         sd::guidance::AdaptiveProjectedGuidance adaptive_projected_guidance(cfg_scale, img_cfg_scale, apg_params);
         const sd::guidance::BaseGuidance& primary_guidance = use_apg_guidance
                                                                  ? static_cast<const sd::guidance::BaseGuidance&>(adaptive_projected_guidance)
@@ -4910,7 +4930,9 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     condition_params.clip_skip = request->clip_skip;
     condition_params.width     = request->width;
     condition_params.height    = request->height;
-    if (ref_image_params.pass_to_vlm) {
+    // JoyAI derives the edit entirely from the VLM's reading of the reference, so
+    // the images must reach the text encoder even though most models opt out.
+    if (ref_image_params.pass_to_vlm || sd_version_is_joyai_image(sd_ctx->sd->version)) {
         condition_params.ref_images = &latents->ref_images;
     }
 

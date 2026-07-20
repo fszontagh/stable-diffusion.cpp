@@ -141,9 +141,11 @@ namespace sd::guidance {
     }
 
     ClassifierFreeGuidance::ClassifierFreeGuidance(float guidance_scale,
-                                                   float image_guidance_scale)
+                                                   float image_guidance_scale,
+                                                   bool normalize_to_cond)
         : guidance_scale_(guidance_scale),
-          image_guidance_scale_(image_guidance_scale) {
+          image_guidance_scale_(image_guidance_scale),
+          normalize_to_cond_(normalize_to_cond) {
     }
 
     GuiderOutput ClassifierFreeGuidance::forward(const GuidanceInput& input,
@@ -173,6 +175,35 @@ namespace sd::guidance {
         } else if (has_tensor(input.pred_img_uncond)) {
             const sd::Tensor<float>& pred_img_uncond = *input.pred_img_uncond;
             output.pred                              = pred_img_uncond + guidance_scale * (pred_cond - pred_img_uncond);
+        }
+
+        if (normalize_to_cond_ && output.pred.numel() == pred_cond.numel() && output.pred.dim() >= 3) {
+            // Match the conditional prediction's channel norm at every spatial
+            // position: pred *= ||pred_cond||_c / ||pred||_c   (upstream does
+            // torch.norm(..., dim=2) over the channel axis).
+            const int64_t W  = output.pred.shape()[0];
+            const int64_t H  = output.pred.shape()[1];
+            const int64_t C  = output.pred.shape()[2];
+            const int64_t N  = output.pred.dim() > 3 ? output.pred.shape()[3] : 1;
+            const int64_t hw = W * H;
+            float* p         = output.pred.data();
+            const float* c   = pred_cond.data();
+            for (int64_t n = 0; n < N; n++) {
+                for (int64_t i = 0; i < hw; i++) {
+                    double cn = 0.0, pn = 0.0;
+                    for (int64_t ch = 0; ch < C; ch++) {
+                        const size_t idx = static_cast<size_t>(n) * C * hw + static_cast<size_t>(ch) * hw + i;
+                        cn += static_cast<double>(c[idx]) * c[idx];
+                        pn += static_cast<double>(p[idx]) * p[idx];
+                    }
+                    if (pn > 0.0) {
+                        const float s = static_cast<float>(std::sqrt(cn) / std::sqrt(pn));
+                        for (int64_t ch = 0; ch < C; ch++) {
+                            p[static_cast<size_t>(n) * C * hw + static_cast<size_t>(ch) * hw + i] *= s;
+                        }
+                    }
+                }
+            }
         }
 
         return output;

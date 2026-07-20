@@ -1800,7 +1800,7 @@ struct LLMEmbedder : public Conditioner {
             arch = LLM::LLMArch::GPT_OSS_20B;
         } else if (sd_version_is_pid(version)) {
             arch = LLM::LLMArch::GEMMA2_2B;
-        } else if (sd_version_is_lingbot_video(version) || sd_version_is_ideogram4(version) || sd_version_is_boogu_image(version) || sd_version_is_sefi_image(version) || sd_version_is_krea2(version)) {
+        } else if (sd_version_is_lingbot_video(version) || sd_version_is_ideogram4(version) || sd_version_is_boogu_image(version) || sd_version_is_sefi_image(version) || sd_version_is_krea2(version) || sd_version_is_joyai_image(version)) {
             arch = LLM::LLMArch::QWEN3_VL;
         } else if (sd_version_is_z_image(version) || version == VERSION_OVIS_IMAGE || version == VERSION_FLUX2_KLEIN) {
             arch = LLM::LLMArch::QWEN3;
@@ -2276,6 +2276,71 @@ struct LLMEmbedder : public Conditioner {
 
                 prompt += "<|im_end|>\n<|im_start|>assistant\n";
             }
+        } else if (sd_version_is_joyai_image(version)) {
+            // JoyImageEditPlusPipeline. The literal "\n" after the leading space is
+            // part of the upstream template. Upstream drops a fixed 34 tokens here,
+            // but that count only holds for their tokenizer's segmentation of that
+            // literal backslash; derive it instead so the split stays on the same
+            // boundary regardless of how the prefix tokenizes.
+            const std::string joyai_system_prefix =
+                "<|im_start|>system\n \\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>";
+            prompt_template_encode_start_idx = static_cast<int>(tokenizer->encode(joyai_system_prefix, nullptr).size());
+
+            prompt = joyai_system_prefix + "user\n";
+
+            std::string img_prompt;
+            if (llm->enable_vision && conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
+                int min_pixels = conditioner_params.ref_image_params.vlm_min_size;
+                if (min_pixels <= 0) {
+                    min_pixels = 384;
+                    if (resize_mode == RefImageResizeMode::AREA) {
+                        min_pixels *= min_pixels;
+                    }
+                }
+                int max_pixels = conditioner_params.ref_image_params.vlm_max_size;
+                if (max_pixels <= 0) {
+                    max_pixels = 560;
+                    if (resize_mode == RefImageResizeMode::AREA) {
+                        max_pixels *= max_pixels;
+                    }
+                }
+
+                const std::string placeholder = "<|image_pad|>";
+                for (size_t i = 0; i < conditioner_params.ref_images->size(); i++) {
+                    const auto& image = (*conditioner_params.ref_images)[i];
+                    const int factor  = llm->config.vision.patch_size * llm->config.vision.spatial_merge_size;
+                    int height        = static_cast<int>(image.shape()[1]);
+                    int width         = static_cast<int>(image.shape()[0]);
+                    int h_bar         = static_cast<int>(std::round(static_cast<double>(height) / factor) * factor);
+                    int w_bar         = static_cast<int>(std::round(static_cast<double>(width) / factor) * factor);
+
+                    resize_image_dims(height, width, h_bar, w_bar, factor, min_pixels, max_pixels, resize_mode);
+                    LOG_DEBUG("resize JoyAI ref image %zu from %dx%d to %dx%d", i, height, width, h_bar, w_bar);
+
+                    auto resized_image = clip_preprocess(image, w_bar, h_bar);
+                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true);
+                    GGML_ASSERT(!image_embed.empty());
+
+                    std::string image_prefix = prompt + img_prompt + "<|vision_start|>";
+                    int image_embed_idx      = static_cast<int>(tokenizer->encode(image_prefix, nullptr).size());
+                    image_embeds.emplace_back(image_embed_idx, image_embed);
+
+                    img_prompt += "<|vision_start|>";
+                    int64_t num_image_tokens = image_embed.shape()[1];
+                    img_prompt.reserve(img_prompt.size() + static_cast<size_t>(num_image_tokens) * placeholder.size() + 32);
+                    for (int j = 0; j < num_image_tokens; j++) {
+                        img_prompt += placeholder;
+                    }
+                    img_prompt += "<|vision_end|>";
+                }
+            }
+            prompt += img_prompt;
+
+            prompt_attn_range.first = static_cast<int>(prompt.size());
+            prompt += conditioner_params.text;
+            prompt_attn_range.second = static_cast<int>(prompt.size());
+
+            prompt += "<|im_end|>\n<|im_start|>assistant\n";
         } else if (sd_version_is_boogu_image(version)) {
             prompt_template_encode_start_idx = 0;
 

@@ -51,10 +51,16 @@ namespace sd::guidance {
     class ClassifierFreeGuidance : public BaseGuidance {
         float guidance_scale_       = 1.0f;
         float image_guidance_scale_ = 1.0f;
+        // Rescale the guided prediction so its per-position channel norm matches
+        // the conditional prediction's. JoyAI's pipeline requires this (its
+        // ComfyUI graph exposes the same thing as a CFGNorm node); without it the
+        // guided step overshoots and the error compounds across steps.
+        bool normalize_to_cond_ = false;
 
     public:
         ClassifierFreeGuidance(float guidance_scale,
-                               float image_guidance_scale);
+                               float image_guidance_scale,
+                               bool normalize_to_cond = false);
 
         GuiderOutput forward(const GuidanceInput& input,
                              GuiderOutput previous,
