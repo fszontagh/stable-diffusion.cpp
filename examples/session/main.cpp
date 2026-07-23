@@ -41,11 +41,54 @@ static void print_help() {
         "  gen [flags]           generate with current params\n"
         "  swap [flags]          free + recreate context\n"
         "  mode sticky|explicit  param inheritance mode\n"
+        "  autoseed on|off       walk the seed after each gen (default off)\n"
         "  stats                 print memory/latency table\n"
         "  export <file>         dump command history\n"
         "  export-cli [--full] [file]  emit an sd-cli command line\n"
         "  run <file>            execute a script of commands\n"
-        "  help / quit\n";
+        "  help / quit\n"
+        "\n"
+        "flags:\n"
+        "  set/gen/load/swap accept any sd-cli flag (-p, -n, --seed, --steps,\n"
+        "  --cfg-scale, -W, -H, --sampling-method, -i, --control-image, ...).\n"
+        "  Run `sd-cli --help` for the full list.\n"
+        "\n"
+        "modes:\n"
+        "  sticky    params persist across gen lines\n"
+        "  explicit  generation params reset to defaults before each gen line\n"
+        "\n"
+        "notes:\n"
+        "  Model/context flags (-m, --control-net, --vae, ...) take effect at `load`;\n"
+        "  changing them afterwards needs `swap` (or unload + load).\n"
+        "  Image flags (-i, --control-image, --mask, --ref-image) are re-read from\n"
+        "  disk on every gen, so a script can step through a sequence of frames.\n"
+        "  A pinned --seed stays pinned across gens; use `autoseed on` to walk it,\n"
+        "  or `--seed -1` for a fresh random seed each gen.\n"
+        "  -o accepts a printf placeholder (out_%02d.png); without one the gen\n"
+        "  index is appended, so images never overwrite each other.\n"
+        "\n"
+        "example:\n"
+        "  mode sticky\n"
+        "  set -m model.safetensors --control-net openpose.safetensors\n"
+        "  set -p \"a walking character\" --steps 24 -W 1024 -H 1024 --strength 0.55\n"
+        "  load\n"
+        "  set --seed 42 -i frame_00.png --control-image pose_00.png\n"
+        "  gen\n";
+}
+
+static void print_usage(const char* prog) {
+    std::cout << version_string() << "\n"
+              << "Usage: " << prog << " [options] < script.session\n"
+              << "       " << prog << " [options]        (interactive REPL)\n"
+              << "\n"
+              << "Keeps one model resident across many generations, so a batch of\n"
+              << "images avoids paying the model load cost per image.\n"
+              << "\n"
+              << "Options:\n"
+              << "  -v, --verbose   verbose logging\n"
+              << "  -h, --help      show this help and exit\n"
+              << "\n";
+    print_help();
 }
 
 static bool run_repl(std::istream& in, bool interactive);
@@ -55,6 +98,9 @@ int main(int argc, const char** argv) {
         std::string arg = argv[i];
         if (arg == "-v" || arg == "--verbose") {
             log_verbose = true;
+        } else if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
         }
     }
     sd_set_log_callback(sd_session_log_cb, nullptr);
@@ -132,7 +178,8 @@ static bool dispatch(Session& sess, const std::string& line) {
             return true;
         }
         if (idx >= 0) {
-            std::cout << "gen ok -> session_out_" << idx << ".png (seed now " << sess.gen.seed << ")\n";
+            std::cout << "gen ok -> " << resolve_session_output_path(sess.cli.output_path, idx)
+                      << " (seed now " << sess.gen.seed << ")\n";
         } else {
             std::cout << "gen ok (no image saved) (seed now " << sess.gen.seed << ")\n";
         }
@@ -157,6 +204,15 @@ static bool dispatch(Session& sess, const std::string& line) {
             sess.history.push_back(line);
         } else {
             std::cout << "usage: mode sticky|explicit\n";
+        }
+    } else if (cmd == "autoseed") {
+        if (args.size() == 1 && (args[0] == "on" || args[0] == "off")) {
+            sess.auto_seed = (args[0] == "on");
+            std::cout << "autoseed " << (sess.auto_seed ? "on" : "off") << "\n";
+            sess.history.push_back(line);
+        } else {
+            std::cout << "usage: autoseed on|off  (currently "
+                      << (sess.auto_seed ? "on" : "off") << ")\n";
         }
     } else if (cmd == "set") {
         std::string err;

@@ -2,15 +2,60 @@
 #include "session_params.h"
 #include "common/media_io.h"
 #include "common/log.h"
+#include <filesystem>
+#include <regex>
 #include <chrono>
 #include <cstdio>
 
 static int g_out_counter = 0;
 
-static bool save_image(const sd_image_t& img, int idx) {
-    char name[64];
-    std::snprintf(name, sizeof(name), "session_out_%04d.png", idx);
-    return write_image_to_file(name, img.data, img.width, img.height, img.channel);
+// Resolves the -o pattern for one generation. A path containing a printf-style
+// placeholder (%d, %04d, ...) gets the running index substituted; a plain path
+// gets the index appended before the extension, because a session writes many
+// images through one setting and would otherwise overwrite the same file.
+std::string resolve_session_output_path(const std::string& output_path, int idx) {
+    namespace fs = std::filesystem;
+
+    fs::path out = output_path.empty() ? fs::path("session_out.png") : fs::path(output_path);
+
+    if (std::regex_search(out.string(), format_specifier_regex)) {
+        if (!out.has_extension()) {
+            out += ".png";
+        }
+        return format_frame_idx(out.string(), idx);
+    }
+
+    fs::path ext = out.has_extension() ? out.extension() : fs::path(".png");
+    fs::path base = out;
+    if (out.has_extension()) {
+        base.replace_extension();
+    }
+    base += "_" + std::to_string(idx);
+    base += ext;
+    return base.string();
+}
+
+static bool save_image(const sd_image_t& img, const std::string& output_path, int idx, std::string& err) {
+    namespace fs = std::filesystem;
+
+    const std::string path = resolve_session_output_path(output_path, idx);
+
+    fs::path parent = fs::path(path).parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        fs::create_directories(parent, ec);
+        if (ec) {
+            err = "cannot create output directory '" + parent.string() + "': " + ec.message();
+            return false;
+        }
+    }
+
+    if (!write_image_to_file(path, img.data, img.width, img.height, img.channel)) {
+        err = "failed to write '" + path + "'";
+        return false;
+    }
+    LOG_INFO("saved '%s'", path.c_str());
+    return true;
 }
 
 bool run_gen(Session& sess, const std::vector<std::string>& args,
@@ -20,6 +65,12 @@ bool run_gen(Session& sess, const std::vector<std::string>& args,
         sess.gen = SDGenerationParams{};
     }
     if (!apply_flags(args, sess.cli, sess.ctx, sess.gen, err)) {
+        return false;
+    }
+    // Flags only record image paths; without this the generator receives empty
+    // buffers and silently falls back to txt2img.
+    if (!load_generation_images(sess.gen, sess.cli.canny_preprocess, sess.cli.verbose)) {
+        err = "failed to load one of the input images";
         return false;
     }
     if (!sess.ensure_ctx(err)) {
@@ -64,14 +115,19 @@ bool run_gen(Session& sess, const std::vector<std::string>& args,
     sess.stats.record(out_timing.seconds, out_timing.before, out_timing.after, get_vram_total_bytes());
     for (int i = 0; i < n; ++i) {
         if (out[i].data) {
-            save_image(out[i], g_out_counter);
+            std::string save_err;
+            if (!save_image(out[i], sess.cli.output_path, g_out_counter, save_err)) {
+                free_sd_images(out, n);
+                err = save_err;
+                return false;
+            }
             out_index = g_out_counter;
             ++g_out_counter;
         }
     }
     free_sd_images(out, n);
 
-    if (sess.sticky) {
+    if (sess.sticky && sess.auto_seed) {
         sess.gen.seed += 1;
     }
     return true;

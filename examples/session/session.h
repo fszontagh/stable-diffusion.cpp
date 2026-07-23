@@ -13,6 +13,10 @@ struct Session {
     SDCtxPtr sd_ctx;
     std::string loaded_ctx_signature;
     bool sticky = true;
+    // Off by default so a pinned seed stays pinned, matching sd-cli. Turn on to
+    // walk the seed across gens (batch variations); `--seed -1` already
+    // randomises per gen without this.
+    bool auto_seed = false;
     Stats stats;
     std::vector<std::string> history;
 

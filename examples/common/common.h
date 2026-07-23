@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -298,6 +299,31 @@ struct SDGenerationParams {
     sd_vid_gen_params_t to_sd_vid_gen_params_t();
     std::string to_string() const;
 };
+
+// Matches a printf-style frame placeholder (%d, %02d, ...) while ignoring
+// escaped '%%'. Used to decide whether an output path is a multi-frame pattern.
+extern const std::regex format_specifier_regex;
+
+// Substitutes every frame placeholder in `pattern` with `frame_idx` and
+// unescapes '%%'. Returns the path unchanged when it holds no placeholder.
+std::string format_frame_idx(std::string pattern, int frame_idx);
+
+bool load_images_from_dir(const std::string dir,
+                          std::vector<SDImageOwner>& images,
+                          int expected_width  = 0,
+                          int expected_height = 0,
+                          int max_image_num   = 0,
+                          bool verbose        = false);
+
+// Reads every image path held in gen_params (init, end, ref, mask, control,
+// control video, PhotoMaker ids) into the matching buffers. Parsing a flag only
+// records the path, so any consumer that skips this step silently generates as
+// if no image had been given. Also infers width/height from the init image and
+// synthesizes the default all-white mask, so call it once after argument
+// parsing and before to_sd_img_gen_params_t().
+bool load_generation_images(SDGenerationParams& gen_params,
+                            bool canny_preprocess = false,
+                            bool verbose          = false);
 
 std::string version_string();
 std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
