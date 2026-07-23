@@ -21,6 +21,13 @@ an OpenPose hint (pose) can be combined in a single generation.
    [h94/IP-Adapter](https://huggingface.co/h94/IP-Adapter):
    - SD 1.5: `models/ip-adapter_sd15.safetensors`
    - SDXL: `sdxl_models/ip-adapter_sdxl_vit-h.safetensors`
+   - SD 1.5 Plus: `models/ip-adapter-plus_sd15.safetensors`
+   - SDXL Plus: `sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors`
+
+The Plus variants use a Resampler image projection over the CLIP-Vision
+hidden states, producing more image tokens and transferring finer detail
+from the reference. The variant is detected from the weight file, so the
+same options work for both; no extra flags are needed.
 
 ## Options
 

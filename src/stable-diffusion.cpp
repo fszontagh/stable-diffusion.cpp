@@ -2083,7 +2083,9 @@ public:
             return;
         }
         auto image_tensor = sd_image_to_tensor(image);
-        auto embed        = get_clip_vision_output(image_tensor, true, -1);
+        auto embed        = ip_adapter->is_plus
+                                ? get_clip_vision_output(image_tensor, false, 2)
+                                : get_clip_vision_output(image_tensor, true, -1);
         if (embed.empty()) {
             return;
         }
