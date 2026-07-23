@@ -80,18 +80,24 @@ namespace {
     // centre on the way down (src = floor((i + 0.5) * 4) = 4i + 2), not the top-left corner, so each
     // 4x4 block ends up filled with its own centre pixel.
     void nearest_block_quantize(sd_image_t& image, int block) {
-        // center_crop_to_multiple ran with the same multiple, so the size is exact and no edge pixels
-        // can be left un-quantized.
-        GGML_ASSERT(image.width % block == 0 && image.height % block == 0);
+        const char* env = getenv("SDCPP_PIXELIZE_BLOCK");
+        if (env != nullptr) {
+            block = atoi(env);
+        }
+        if (block <= 1) {
+            return;
+        }
         const uint32_t w = image.width;
         const uint32_t h = image.height;
         const uint32_t c = image.channel;
         for (uint32_t by = 0; by < h; by += block) {
             for (uint32_t bx = 0; bx < w; bx += block) {
-                const uint32_t sx = bx + block / 2;
-                const uint32_t sy = by + block / 2;
-                for (uint32_t y = by; y < by + block; y++) {
-                    for (uint32_t x = bx; x < bx + block; x++) {
+                uint32_t sx = bx + block / 2;
+                uint32_t sy = by + block / 2;
+                if (sx >= w) sx = w - 1;
+                if (sy >= h) sy = h - 1;
+                for (uint32_t y = by; y < by + block && y < h; y++) {
+                    for (uint32_t x = bx; x < bx + block && x < w; x++) {
                         for (uint32_t ic = 0; ic < c; ic++) {
                             image.data[(y * image.width + x) * c + ic] =
                                 image.data[(sy * image.width + sx) * c + ic];
