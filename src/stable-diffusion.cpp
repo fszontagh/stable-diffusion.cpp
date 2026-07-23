@@ -3546,6 +3546,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->width                                 = 512;
     sd_vid_gen_params->height                                = 512;
     sd_vid_gen_params->strength                              = 0.75f;
+    sd_vid_gen_params->control_strength                      = 0.9f;
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
@@ -6159,7 +6160,7 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
     img_gen_params.init_image        = sd_vid_gen_params->init_image;
     img_gen_params.seed              = sd_vid_gen_params->seed;
     img_gen_params.batch_count       = 1;
-    img_gen_params.control_strength  = 1.0f;
+    img_gen_params.control_strength  = sd_vid_gen_params->control_strength;
     img_gen_params.vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
     img_gen_params.cache             = sd_vid_gen_params->cache;
     img_gen_params.hires             = sd_vid_gen_params->hires;

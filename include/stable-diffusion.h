@@ -395,6 +395,7 @@ typedef struct {
     sd_image_t end_image;
     sd_image_t* control_frames;
     int control_frames_size;
+    float control_strength;
     int width;
     int height;
     sd_sample_params_t sample_params;

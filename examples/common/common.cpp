@@ -2558,6 +2558,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.end_image                 = end_image.get();
     params.control_frames            = control_frame_views.empty() ? nullptr : control_frame_views.data();
     params.control_frames_size       = static_cast<int>(control_frame_views.size());
+    params.control_strength          = control_strength;
     params.width                     = get_resolved_width();
     params.height                    = get_resolved_height();
     params.sample_params             = sample_params;
