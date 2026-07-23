@@ -85,7 +85,7 @@ bool RemBGGGML::load_from_file(const std::string& path, int n_threads_in) {
     model_path = path;
 
     std::string error;
-    if (!backend_manager.init(backend_spec.c_str(), params_backend_spec.c_str(), &error)) {
+    if (!backend_manager.init(backend_spec.c_str(), params_backend_spec.c_str(), /*split_mode_spec=*/nullptr, &error)) {
         LOG_ERROR("rembg backend config failed: %s", error.c_str());
         return false;
     }
