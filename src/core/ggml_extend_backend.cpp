@@ -87,6 +87,10 @@ static bool parse_backend_module(const std::string& raw_name, SDBackendModule* m
         *module = SDBackendModule::PIXELIZATION;
         return true;
     }
+    if (name == "detector" || name == "adetailer" || name == "yolo") {
+        *module = SDBackendModule::DETECTOR;
+        return true;
+    }
     return false;
 }
 
@@ -962,6 +966,8 @@ const char* sd_backend_module_name(SDBackendModule module) {
             return "upscaler";
         case SDBackendModule::PIXELIZATION:
             return "pixelization";
+        case SDBackendModule::DETECTOR:
+            return "detector";
     }
     return "unknown";
 }

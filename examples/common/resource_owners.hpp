@@ -47,6 +47,13 @@ struct PixelizerCtxDeleter {
         }
     }
 };
+struct ADetailerCtxDeleter {
+    void operator()(adetailer_ctx_t* ctx) const {
+        if (ctx != nullptr) {
+            free_adetailer_ctx(ctx);
+        }
+    }
+};
 
 template <typename T>
 using FreeUniquePtr = std::unique_ptr<T, FreeDeleter>;
@@ -55,6 +62,7 @@ using FilePtr         = std::unique_ptr<FILE, FileCloser>;
 using SDCtxPtr        = std::unique_ptr<sd_ctx_t, SDCtxDeleter>;
 using UpscalerCtxPtr  = std::unique_ptr<upscaler_ctx_t, UpscalerCtxDeleter>;
 using PixelizerCtxPtr = std::unique_ptr<pixelizer_ctx_t, PixelizerCtxDeleter>;
+using ADetailerCtxPtr = std::unique_ptr<adetailer_ctx_t, ADetailerCtxDeleter>;
 
 class SDImageOwner {
 private:
