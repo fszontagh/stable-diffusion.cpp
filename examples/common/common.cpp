@@ -1186,6 +1186,18 @@ ArgOptions SDGenerationParams::get_options() {
          "tile overlap for vae tiling, in fraction of tile size (default: 0.5)",
          &vae_tiling_params.target_overlap},
         {"",
+         "--diffusion-tile-overlap",
+         "tile overlap for tiled diffusion, in fraction of tile size (default: 0.5)",
+         &diffusion_tiling_params.target_overlap},
+        {"",
+         "--region-base-weight",
+         "weight of the main prompt across the whole canvas when using --region (default: 1.0)",
+         &region_base_weight},
+        {"",
+         "--region-feather",
+         "feather width of region edges, in latent pixels (default: 4)",
+         &region_feather},
+        {"",
          "--hires-scale",
          "highres fix scale when target size is not set (default: 2.0)",
          &hires_scale},
@@ -1238,6 +1250,11 @@ ArgOptions SDGenerationParams::get_options() {
          "enable highres fix",
          true,
          &hires_enabled},
+        {"",
+         "--diffusion-tiling",
+         "enable tiled diffusion (MultiDiffusion): denoise overlapping latent windows and blend them each step",
+         true,
+         &diffusion_tiling_params.enabled},
     };
 
     auto on_seed_arg = [&](int argc, const char** argv, int index) {
@@ -1496,6 +1513,35 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    auto on_region_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        region_specs.emplace_back(argv[index]);
+        return 1;
+    };
+
+    auto on_diffusion_tile_size_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        std::string tile_size_str = argv[index];
+        size_t x_pos              = tile_size_str.find('x');
+        try {
+            if (x_pos != std::string::npos) {
+                diffusion_tiling_params.tile_size_x = std::stoi(tile_size_str.substr(0, x_pos));
+                diffusion_tiling_params.tile_size_y = std::stoi(tile_size_str.substr(x_pos + 1));
+            } else {
+                diffusion_tiling_params.tile_size_x = diffusion_tiling_params.tile_size_y = std::stoi(tile_size_str);
+            }
+        } catch (const std::invalid_argument&) {
+            return -1;
+        } catch (const std::out_of_range&) {
+            return -1;
+        }
+        return 1;
+    };
+
     auto on_relative_tile_size_arg = [&](int argc, const char** argv, int index) {
         if (++index >= argc) {
             return -1;
@@ -1637,6 +1683,14 @@ ArgOptions SDGenerationParams::get_options() {
          "--vae-tile-size",
          "tile size for vae tiling, format [X]x[Y] (default: 32x32)",
          on_tile_size_arg},
+        {"",
+         "--region",
+         "regional prompt, format x,y,w,h[,weight]:prompt with coordinates as fractions of the canvas (repeatable)",
+         on_region_arg},
+        {"",
+         "--diffusion-tile-size",
+         "tile size for tiled diffusion (MultiDiffusion), in latent pixels, format [X]x[Y] (default: 64x64)",
+         on_diffusion_tile_size_arg},
         {"",
          "--vae-relative-tile-size",
          "relative tile size for vae tiling, format [X]x[Y], in fraction of image size if < 1, in number of tiles per dim if >=1 (overrides --vae-tile-size)",
@@ -2556,31 +2610,74 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
         LOG_WARN("Notice: --increase-ref-index is deprecated. Use --ref-image-args \"ref_index_mode=increase\" instead.");
     }
 
-    params.loras               = lora_vec.empty() ? nullptr : lora_vec.data();
-    params.lora_count          = static_cast<uint32_t>(lora_vec.size());
-    params.prompt              = prompt.c_str();
-    params.negative_prompt     = negative_prompt.c_str();
-    params.clip_skip           = clip_skip;
-    params.init_image          = init_image.get();
-    params.ref_images          = ref_image_views.empty() ? nullptr : ref_image_views.data();
-    params.ref_images_count    = static_cast<int>(ref_image_views.size());
-    params.ref_image_args      = ref_image_args.c_str();
-    params.mask_image          = mask_image.get();
-    params.width               = get_resolved_width();
-    params.height              = get_resolved_height();
-    params.sample_params       = sample_params;
-    params.strength            = strength;
-    params.seed                = seed;
-    params.batch_count         = batch_count;
-    params.qwen_image_layers   = qwen_image_layers;
-    params.control_image       = control_image.get();
-    params.control_strength    = control_strength;
-    params.ip_adapter_image    = ip_adapter_image.get();
-    params.ip_adapter_strength = ip_adapter_strength;
-    params.pm_params           = pm_params;
-    params.pulid_params        = pulid_params;
-    params.vae_tiling_params   = vae_tiling_params;
-    params.cache               = cache_params;
+    params.loras                   = lora_vec.empty() ? nullptr : lora_vec.data();
+    params.lora_count              = static_cast<uint32_t>(lora_vec.size());
+    params.prompt                  = prompt.c_str();
+    params.negative_prompt         = negative_prompt.c_str();
+    params.clip_skip               = clip_skip;
+    params.init_image              = init_image.get();
+    params.ref_images              = ref_image_views.empty() ? nullptr : ref_image_views.data();
+    params.ref_images_count        = static_cast<int>(ref_image_views.size());
+    params.ref_image_args          = ref_image_args.c_str();
+    params.mask_image              = mask_image.get();
+    params.width                   = get_resolved_width();
+    params.height                  = get_resolved_height();
+    params.sample_params           = sample_params;
+    params.strength                = strength;
+    params.seed                    = seed;
+    params.batch_count             = batch_count;
+    params.qwen_image_layers       = qwen_image_layers;
+    params.control_image           = control_image.get();
+    params.control_strength        = control_strength;
+    params.ip_adapter_image        = ip_adapter_image.get();
+    params.ip_adapter_strength     = ip_adapter_strength;
+    params.pm_params               = pm_params;
+    params.pulid_params            = pulid_params;
+    params.vae_tiling_params       = vae_tiling_params;
+    params.diffusion_tiling_params = diffusion_tiling_params;
+
+    region_prompts.clear();
+    region_views.clear();
+    region_prompts.reserve(region_specs.size());
+    region_views.reserve(region_specs.size());
+    for (const std::string& spec : region_specs) {
+        size_t colon = spec.find(':');
+        if (colon == std::string::npos) {
+            LOG_WARN("ignoring malformed --region (missing ':'): %s", spec.c_str());
+            continue;
+        }
+        std::string geometry = spec.substr(0, colon);
+        std::vector<float> values;
+        std::stringstream geometry_stream(geometry);
+        std::string field;
+        bool parsed = true;
+        while (std::getline(geometry_stream, field, ',')) {
+            try {
+                values.push_back(std::stof(field));
+            } catch (const std::exception&) {
+                parsed = false;
+                break;
+            }
+        }
+        if (!parsed || values.size() < 4 || values.size() > 5) {
+            LOG_WARN("ignoring malformed --region geometry: %s", spec.c_str());
+            continue;
+        }
+        region_prompts.push_back(spec.substr(colon + 1));
+        sd_region_t region;
+        region.prompt = region_prompts.back().c_str();
+        region.x      = values[0];
+        region.y      = values[1];
+        region.width  = values[2];
+        region.height = values[3];
+        region.weight = values.size() == 5 ? values[4] : 1.0f;
+        region_views.push_back(region);
+    }
+    params.regions            = region_views.empty() ? nullptr : region_views.data();
+    params.region_count       = static_cast<int>(region_views.size());
+    params.region_base_weight = region_base_weight;
+    params.region_feather     = region_feather;
+    params.cache                   = cache_params;
 
     params.hires.enabled             = hires_enabled;
     params.hires.upscaler            = resolved_hires_upscaler;
@@ -2683,6 +2780,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.fps                       = fps;
     params.vace_strength             = vace_strength;
     params.vae_tiling_params         = vae_tiling_params;
+    params.diffusion_tiling_params   = diffusion_tiling_params;
     params.cache                     = cache_params;
     params.hires.enabled             = hires_enabled;
     params.hires.upscaler            = resolved_hires_upscaler;

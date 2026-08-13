@@ -20,6 +20,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -918,8 +919,15 @@ __STATIC_INLINE__ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& in
             int overlap_y_out = decode ? tile_overlap_y * scale : tile_overlap_y;
 
             int64_t t1       = ggml_time_ms();
-            auto input_tile  = sd_tensor_split_2d(input, input_tile_size_x, input_tile_size_y, x_in, y_in);
-            auto output_tile = on_processing(input_tile);
+            auto input_tile = sd_tensor_split_2d(input, input_tile_size_x, input_tile_size_y, x_in, y_in);
+            // Callbacks that care where the tile sits in the full canvas (tiled diffusion
+            // needs it for position encodings) take the origin as extra arguments.
+            sd::Tensor<float> output_tile;
+            if constexpr (std::is_invocable_v<Fn&, const sd::Tensor<float>&, int, int>) {
+                output_tile = on_processing(input_tile, x_in, y_in);
+            } else {
+                output_tile = on_processing(input_tile);
+            }
             if (output_tile.empty()) {
                 return {};
             }

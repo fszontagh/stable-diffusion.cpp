@@ -133,6 +133,14 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           MiniT2IDiffusionExtra,
                                           HunyuanVideoDiffusionExtra>;
 
+// Position of a latent window inside the full canvas, in latent pixels. Under tiled
+// diffusion each window is a crop of a larger latent; models with explicit position
+// encodings need the absolute offset so a window is not treated as a whole image.
+struct LatentWindow {
+    int64_t x_offset = 0;
+    int64_t y_offset = 0;
+};
+
 struct DiffusionParams {
     const sd::Tensor<float>* x                        = nullptr;
     const sd::Tensor<float>* timesteps                = nullptr;
@@ -141,6 +149,7 @@ struct DiffusionParams {
     const sd::Tensor<float>* y                        = nullptr;
     const std::vector<sd::Tensor<float>>* ref_latents = nullptr;
     RefImageParams ref_image_params                   = {false, false, Rope::RefIndexMode::FIXED, false};
+    LatentWindow window                               = {};
     DiffusionExtraParams extra                        = std::monostate{};
 };
 

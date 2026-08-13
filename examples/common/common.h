@@ -232,11 +232,17 @@ struct SDGenerationParams {
     bool scm_policy_dynamic = true;
     sd_cache_params_t cache_params{};
 
-    float moe_boundary                   = 0.875f;
-    int video_frames                     = 1;
-    int fps                              = 16;
-    float vace_strength                  = 1.f;
-    sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    float moe_boundary                         = 0.875f;
+    int video_frames                           = 1;
+    int fps                                    = 16;
+    float vace_strength                        = 1.f;
+    sd_tiling_params_t vae_tiling_params       = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    sd_tiling_params_t diffusion_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    std::vector<std::string> region_specs;
+    std::vector<std::string> region_prompts;
+    std::vector<sd_region_t> region_views;
+    float region_base_weight = 1.0f;
+    float region_feather     = 4.0f;
     std::string extra_tiling_args;
 
     std::string ref_image_args;

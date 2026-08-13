@@ -405,12 +405,15 @@ namespace Rope {
                                                                    const std::vector<ggml_tensor*>& ref_latents,
                                                                    RefIndexMode ref_index_mode,
                                                                    float ref_index_scale,
-                                                                   bool is_longcat) {
+                                                                   bool is_longcat,
+                                                                   int h_window_offset = 0,
+                                                                   int w_window_offset = 0) {
         int x_index = is_longcat ? 1 : 0;
 
         auto txt_ids = is_longcat ? gen_longcat_txt_ids(bs, context_len, axes_dim_num) : gen_flux_txt_ids(bs, context_len, axes_dim_num, txt_arange_dims);
         int offset   = is_longcat ? context_len : 0;
-        auto img_ids = gen_flux_img_ids(h, w, patch_size, bs, axes_dim_num, x_index, offset, offset);
+        auto img_ids = gen_flux_img_ids(h, w, patch_size, bs, axes_dim_num, x_index,
+                                        offset + h_window_offset, offset + w_window_offset);
 
         auto ids = concat_ids(txt_ids, img_ids, bs);
         if (ref_latents.size() > 0) {
@@ -434,7 +437,9 @@ namespace Rope {
                                                      bool circular_h,
                                                      bool circular_w,
                                                      const std::vector<int>& axes_dim,
-                                                     bool is_longcat) {
+                                                     bool is_longcat,
+                                                     int h_window_offset = 0,
+                                                     int w_window_offset = 0) {
         std::vector<std::vector<float>> ids = gen_flux_ids(h,
                                                            w,
                                                            patch_size,
@@ -445,7 +450,9 @@ namespace Rope {
                                                            ref_latents,
                                                            ref_index_mode,
                                                            ref_index_scale,
-                                                           is_longcat);
+                                                           is_longcat,
+                                                           h_window_offset,
+                                                           w_window_offset);
         std::vector<std::vector<int>> wrap_dims;
         if ((circular_h || circular_w) && bs > 0 && axes_dim.size() >= 3) {
             int h_len = (h + (patch_size / 2)) / patch_size;

@@ -180,6 +180,17 @@ typedef struct {
     const char* path;
 } sd_embedding_t;
 
+// Regional prompting: an axis-aligned area of the canvas that uses its own prompt.
+// Coordinates are normalized to [0, 1] so they stay valid across resolutions.
+typedef struct {
+    const char* prompt;
+    float x;
+    float y;
+    float width;
+    float height;
+    float weight;
+} sd_region_t;
+
 enum sd_vae_format_t {
     SD_VAE_FORMAT_AUTO = -1,
     SD_VAE_FORMAT_FLUX,
@@ -393,6 +404,11 @@ typedef struct {
     sd_pm_params_t pm_params;
     sd_pulid_params_t pulid_params;
     sd_tiling_params_t vae_tiling_params;
+    sd_tiling_params_t diffusion_tiling_params;
+    const sd_region_t* regions;
+    int region_count;
+    float region_base_weight;
+    float region_feather;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
     int qwen_image_layers;
@@ -427,6 +443,7 @@ typedef struct {
     int fps;
     float vace_strength;
     sd_tiling_params_t vae_tiling_params;
+    sd_tiling_params_t diffusion_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
     bool circular_x;

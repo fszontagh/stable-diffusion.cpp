@@ -61,7 +61,9 @@
 #include "model/vae/wan_vae.hpp"
 #include "runtime/denoiser.hpp"
 #include "runtime/guidance.h"
+#include "runtime/regional_prompt.hpp"
 #include "runtime/sample-cache.h"
+#include "runtime/tiled_diffusion.hpp"
 #include "upscaler.h"
 
 #include "name_conversion.h"
@@ -244,8 +246,9 @@ public:
     int animatediff_num_frames  = 0;
 
     std::string taesd_path;
-    sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0, 0, nullptr};
-    bool enable_mmap                     = false;
+    sd_tiling_params_t vae_tiling_params       = {false, false, 0, 0, 0.5f, 0, 0, nullptr};
+    sd_tiling_params_t diffusion_tiling_params = {false, false, 0, 0, 0.5f, 0, 0, nullptr};
+    bool enable_mmap                           = false;
     sd::ggml_graph_cut::MaxVramAssignment max_vram_assignment;
     bool stream_layers = false;
     bool eager_load    = false;
@@ -2530,7 +2533,10 @@ public:
                              int audio_length,
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
-                             const sd::Tensor<float>& video_positions = {}) {
+                             const sd::Tensor<float>& video_positions           = {},
+                             const std::vector<SDCondition>& region_conds       = {},
+                             const std::vector<sd::Tensor<float>>& region_masks = {},
+                             const sd::Tensor<float>& region_base_mask          = {}) {
         struct RunnerDoneOnExit {
             GGMLRunner* runner = nullptr;
             ~RunnerDoneOnExit() {
@@ -2614,6 +2620,52 @@ public:
             noise *= eta;
         }
 
+        // MultiDiffusion: denoise overlapping latent windows and blend them every step.
+        // Each window is a native-resolution latent as far as the model is concerned, so
+        // no per-architecture position handling is needed.
+        bool use_diffusion_tiling    = diffusion_tiling_params.enabled;
+        int diffusion_tile_size_x    = 0;
+        int diffusion_tile_size_y    = 0;
+        float diffusion_tile_overlap = 0.f;
+        if (use_diffusion_tiling) {
+            bool cache_enabled = cache_runtime.spectrum_enabled ||
+                                 cache_runtime.easycache_enabled() ||
+                                 cache_runtime.ucache_enabled() ||
+                                 cache_runtime.cachedit_enabled();
+            if (!control_image.empty()) {
+                LOG_WARN("tiled diffusion does not support ControlNet yet, disabling tiled diffusion");
+                use_diffusion_tiling = false;
+            } else if (needs_uncond_denoised) {
+                LOG_WARN("tiled diffusion does not support CFG++ samplers, disabling tiled diffusion");
+                use_diffusion_tiling = false;
+            } else if (cache_enabled) {
+                LOG_WARN("tiled diffusion does not support step caching, disabling tiled diffusion");
+                use_diffusion_tiling = false;
+            } else if (init_latent.dim() < 4) {
+                LOG_WARN("tiled diffusion requires a 4d latent, disabling tiled diffusion");
+                use_diffusion_tiling = false;
+            } else if (!region_conds.empty()) {
+                LOG_WARN("tiled diffusion cannot be combined with regional prompting yet, disabling tiled diffusion");
+                use_diffusion_tiling = false;
+            }
+        }
+        if (use_diffusion_tiling) {
+            sd::tiling::resolve_tile_sizes(diffusion_tile_size_x,
+                                           diffusion_tile_size_y,
+                                           diffusion_tile_overlap,
+                                           diffusion_tiling_params,
+                                           init_latent.shape()[0],
+                                           init_latent.shape()[1],
+                                           1.0f,
+                                           sd::tiling::kDefaultDiffusionTileSize);
+            LOG_INFO("tiled diffusion: latent %" PRId64 "x%" PRId64 ", tile %dx%d, overlap %.2f",
+                     init_latent.shape()[0],
+                     init_latent.shape()[1],
+                     diffusion_tile_size_x,
+                     diffusion_tile_size_y,
+                     diffusion_tile_overlap);
+        }
+
         int64_t last_progress_us     = ggml_time_us();
         SamplePreviewContext preview = prepare_sample_preview_context();
 
@@ -2686,194 +2738,228 @@ public:
             sd::Tensor<float> uncond_out;
             sd::Tensor<float> img_uncond_out;
             sd_sample::SampleStepCacheDispatcher step_cache(cache_runtime, step, sigma);
-            std::vector<sd::Tensor<float>> controls;
-            DiffusionParams diffusion_params;
-            diffusion_params.x                = &noised_input;
-            diffusion_params.timesteps        = &timesteps_tensor;
-            diffusion_params.ref_image_params = ref_image_params;
             sd::guidance::GuidanceInput step_guidance_input;
             step_guidance_input.step          = step;
             step_guidance_input.schedule_size = sigmas.size();
             bool is_skiplayer_step            = skip_layer_guidance.is_enabled_for_step(step_guidance_input);
-
-            compute_sample_controls(control_image,
-                                    noised_input,
-                                    timesteps_tensor,
-                                    cond,
-                                    &controls);
 
             static const std::vector<sd::Tensor<float>> empty_ref_latents;
             bool uncond_without_ref_latents = !img_uncond.empty() &&
                                               !ref_latents.empty() &&
                                               sd_version_supports_ref_latent_img_cfg(version);
 
-            auto run_condition = [&](const SDCondition& condition,
-                                     const sd::Tensor<float>* c_concat_override                 = nullptr,
-                                     const std::vector<int>* local_skip_layers                  = nullptr,
-                                     const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
-                                     bool use_uncond_ip                                         = false) -> sd::Tensor<float> {
-                diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
-                diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
-                diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
-                diffusion_params.ref_latents = ref_latents_override != nullptr ? ref_latents_override : (condition.c_ref_images.empty() ? &ref_latents : &condition.c_ref_images);
+            // Runs the model plus guidance for one latent window. Called once for the whole
+            // latent normally, or once per window under tiled diffusion.
+            auto predict = [&](const sd::Tensor<float>& model_input, int window_x = 0, int window_y = 0) -> sd::Tensor<float> {
+                std::vector<sd::Tensor<float>> controls;
+                DiffusionParams diffusion_params;
+                diffusion_params.x                = &model_input;
+                diffusion_params.timesteps        = &timesteps_tensor;
+                diffusion_params.ref_image_params = ref_image_params;
+                diffusion_params.window           = {window_x, window_y};
 
-                if (sd_version_is_unet(version)) {
-                    int nvf = -1;
-                    if (animatediff_loaded && noised_input.dim() >= 4 && noised_input.shape()[3] > 1) {
-                        nvf = static_cast<int>(noised_input.shape()[3]);
+                compute_sample_controls(control_image,
+                                        model_input,
+                                        timesteps_tensor,
+                                        cond,
+                                        &controls);
+
+                auto run_condition = [&](const SDCondition& condition,
+                                         const sd::Tensor<float>* c_concat_override                 = nullptr,
+                                         const std::vector<int>* local_skip_layers                  = nullptr,
+                                         const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
+                                         bool use_uncond_ip                                         = false) -> sd::Tensor<float> {
+                    diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                    diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
+                    diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                    diffusion_params.ref_latents = ref_latents_override != nullptr ? ref_latents_override : (condition.c_ref_images.empty() ? &ref_latents : &condition.c_ref_images);
+
+                    if (sd_version_is_unet(version)) {
+                        int nvf = -1;
+                        if (animatediff_loaded && model_input.dim() >= 4 && model_input.shape()[3] > 1) {
+                            nvf = static_cast<int>(model_input.shape()[3]);
+                        }
+                        UNetDiffusionExtra unet_extra{nvf, &controls, control_strength};
+                        const auto& ip_tokens = use_uncond_ip ? ip_adapter_uncond_tokens : ip_adapter_tokens;
+                        if (!ip_tokens.empty()) {
+                            unet_extra.ip_context = &ip_tokens;
+                            unet_extra.ip_scale   = ip_adapter_strength;
+                        }
+                        diffusion_params.extra = unet_extra;
+                    } else if (sd_version_is_sd3(version)) {
+                        diffusion_params.extra = SkipLayerDiffusionExtra{local_skip_layers};
+                    } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
+                        diffusion_params.extra = FluxDiffusionExtra{&guidance_tensor,
+                                                                    local_skip_layers};
+                    } else if (sd_version_is_anima(version)) {
+                        diffusion_params.extra = AnimaDiffusionExtra{condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids,
+                                                                     condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights};
+                    } else if (sd_version_is_wan(version)) {
+                        diffusion_params.extra = WanDiffusionExtra{vace_context.empty() ? nullptr : &vace_context,
+                                                                   vace_strength};
+                    } else if (sd_version_is_hunyuan_video(version)) {
+                        diffusion_params.extra = HunyuanVideoDiffusionExtra{
+                            &guidance_tensor,
+                            condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0],
+                            condition.c_vector.empty() ? nullptr : &condition.c_vector,
+                            hunyuan_timestep_r_tensor.empty() ? nullptr : &hunyuan_timestep_r_tensor};
+                    } else if (version == VERSION_HIDREAM_O1) {
+                        diffusion_params.extra = HiDreamO1DiffusionExtra{
+                            condition.c_input_ids.empty() ? nullptr : &condition.c_input_ids,
+                            condition.c_position_ids.empty() ? nullptr : &condition.c_position_ids,
+                            condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
+                            condition.c_vinput_mask.empty() ? nullptr : &condition.c_vinput_mask,
+                            condition.c_image_embeds.empty() ? nullptr : &condition.c_image_embeds};
+                    } else if (sd_version_is_minimax_h3(version)) {
+                        diffusion_params.extra = MiniMaxH3DiffusionExtra{
+                            condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
+                            condition.c_position_ids.empty() ? nullptr : &condition.c_position_ids,
+                            condition.c_ref_audios.empty() ? nullptr : &condition.c_ref_audios,
+                            condition.c_reference_blocks.empty() ? nullptr : &condition.c_reference_blocks,
+                            audio_length,
+                            std::isfinite(active_flow_shift) ? active_flow_shift : 12.f,
+                            3.f};
+                    } else if (sd_version_is_ltxav(version)) {
+                        diffusion_params.extra = LTXAVDiffusionExtra{
+                            nullptr,
+                            audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
+                            audio_length,
+                            frame_rate,
+                            video_positions.empty() ? nullptr : &video_positions};
+                    } else if (sd_version_is_minit2i(version)) {
+                        diffusion_params.extra = MiniT2IDiffusionExtra{
+                            condition.c_vector.empty() ? nullptr : &condition.c_vector};
+                    } else {
+                        diffusion_params.extra = std::monostate{};
                     }
-                    UNetDiffusionExtra unet_extra{nvf, &controls, control_strength};
-                    const auto& ip_tokens = use_uncond_ip ? ip_adapter_uncond_tokens : ip_adapter_tokens;
-                    if (!ip_tokens.empty()) {
-                        unet_extra.ip_context = &ip_tokens;
-                        unet_extra.ip_scale   = ip_adapter_strength;
+
+                    sd::Tensor<float> cached_output;
+                    if (step_cache.before_condition(&condition, model_input, &cached_output)) {
+                        return std::move(cached_output);
                     }
-                    diffusion_params.extra = unet_extra;
-                } else if (sd_version_is_sd3(version)) {
-                    diffusion_params.extra = SkipLayerDiffusionExtra{local_skip_layers};
-                } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
-                    diffusion_params.extra = FluxDiffusionExtra{&guidance_tensor,
-                                                                local_skip_layers};
-                } else if (sd_version_is_anima(version)) {
-                    diffusion_params.extra = AnimaDiffusionExtra{condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids,
-                                                                 condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights};
-                } else if (sd_version_is_wan(version)) {
-                    diffusion_params.extra = WanDiffusionExtra{vace_context.empty() ? nullptr : &vace_context,
-                                                               vace_strength};
-                } else if (sd_version_is_hunyuan_video(version)) {
-                    diffusion_params.extra = HunyuanVideoDiffusionExtra{
-                        &guidance_tensor,
-                        condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0],
-                        condition.c_vector.empty() ? nullptr : &condition.c_vector,
-                        hunyuan_timestep_r_tensor.empty() ? nullptr : &hunyuan_timestep_r_tensor};
-                } else if (version == VERSION_HIDREAM_O1) {
-                    diffusion_params.extra = HiDreamO1DiffusionExtra{
-                        condition.c_input_ids.empty() ? nullptr : &condition.c_input_ids,
-                        condition.c_position_ids.empty() ? nullptr : &condition.c_position_ids,
-                        condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
-                        condition.c_vinput_mask.empty() ? nullptr : &condition.c_vinput_mask,
-                        condition.c_image_embeds.empty() ? nullptr : &condition.c_image_embeds};
-                } else if (sd_version_is_minimax_h3(version)) {
-                    diffusion_params.extra = MiniMaxH3DiffusionExtra{
-                        condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
-                        condition.c_position_ids.empty() ? nullptr : &condition.c_position_ids,
-                        condition.c_ref_audios.empty() ? nullptr : &condition.c_ref_audios,
-                        condition.c_reference_blocks.empty() ? nullptr : &condition.c_reference_blocks,
-                        audio_length,
-                        std::isfinite(active_flow_shift) ? active_flow_shift : 12.f,
-                        3.f};
-                } else if (sd_version_is_ltxav(version)) {
-                    diffusion_params.extra = LTXAVDiffusionExtra{
-                        nullptr,
-                        audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
-                        audio_length,
-                        frame_rate,
-                        video_positions.empty() ? nullptr : &video_positions};
-                } else if (sd_version_is_minit2i(version)) {
-                    diffusion_params.extra = MiniT2IDiffusionExtra{
-                        condition.c_vector.empty() ? nullptr : &condition.c_vector};
-                } else {
-                    diffusion_params.extra = std::monostate{};
-                }
 
-                sd::Tensor<float> cached_output;
-                if (step_cache.before_condition(&condition, noised_input, &cached_output)) {
-                    return std::move(cached_output);
-                }
+                    for (const auto& extension : generation_extensions) {
+                        extension->before_diffusion(diffusion_params, step);
+                    }
 
+                    auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+                    if (output_opt.empty()) {
+                        LOG_ERROR("diffusion model compute failed");
+                        return sd::Tensor<float>();
+                    }
+
+                    step_cache.after_condition(&condition, model_input, output_opt);
+                    return output_opt;
+                };
+
+                const SDCondition* positive_condition      = &cond;
+                const sd::Tensor<float>* c_concat_override = nullptr;
                 for (const auto& extension : generation_extensions) {
-                    extension->before_diffusion(diffusion_params, step);
+                    const SDCondition& next_condition = extension->before_condition(step, *positive_condition);
+                    if (&next_condition != positive_condition) {
+                        positive_condition = &next_condition;
+                        if (positive_condition != &cond) {
+                            c_concat_override = cond.c_concat.empty() ? nullptr : &cond.c_concat;
+                        }
+                        break;
+                    }
                 }
 
-                auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
-                if (output_opt.empty()) {
-                    LOG_ERROR("diffusion model compute failed");
-                    return sd::Tensor<float>();
+                cond_out = run_condition(*positive_condition, c_concat_override);
+                if (cond_out.empty()) {
+                    return {};
+                }
+                if (!region_conds.empty()) {
+                    cond_out = cond_out * region_base_mask;
+                    for (size_t r = 0; r < region_conds.size(); r++) {
+                        sd::Tensor<float> region_out = run_condition(region_conds[r], c_concat_override);
+                        if (region_out.empty()) {
+                            return {};
+                        }
+                        cond_out = cond_out + region_out * region_masks[r];
+                    }
                 }
 
-                step_cache.after_condition(&condition, noised_input, output_opt);
-                return output_opt;
+                if (!uncond.empty()) {
+                    if (!step_cache.is_step_skipped()) {
+                        compute_sample_controls(control_image,
+                                                model_input,
+                                                timesteps_tensor,
+                                                uncond,
+                                                &controls);
+                    }
+                    const std::vector<int>* uncond_skip_layers = nullptr;
+                    if (is_skiplayer_step && slg_uncond) {
+                        LOG_DEBUG("Skipping layers at uncond step %d\n", step);
+                        uncond_skip_layers = &skip_layer_guidance.layers();
+                    }
+                    uncond_out = run_condition(uncond,
+                                               uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
+                                               uncond_skip_layers,
+                                               nullptr,
+                                               true);
+                    if (uncond_out.empty()) {
+                        return {};
+                    }
+                }
+                if (!img_uncond.empty()) {
+                    img_uncond_out = run_condition(img_uncond,
+                                                   img_uncond.c_concat.empty() ? nullptr : &img_uncond.c_concat,
+                                                   nullptr,
+                                                   uncond_without_ref_latents ? &empty_ref_latents : nullptr,
+                                                   true);
+                    if (img_uncond_out.empty()) {
+                        return {};
+                    }
+                }
+                sd::guidance::GuidanceInput guidance_input;
+                guidance_input.step            = step;
+                guidance_input.schedule_size   = sigmas.size();
+                guidance_input.pred_cond       = &cond_out;
+                guidance_input.pred_uncond     = uncond_out.empty() ? nullptr : &uncond_out;
+                guidance_input.pred_img_uncond = img_uncond_out.empty() ? nullptr : &img_uncond_out;
+
+                sd::guidance::GuiderOutput guided = guidance_schedule.empty() ? primary_guidance.forward(guidance_input, {}) : primary_guidance.forward(guidance_input, {}, guidance_schedule[guidance_schedule.size() - 1 - step]);
+                if (guided.pred.empty()) {
+                    return {};
+                }
+
+                if (is_skiplayer_step && slg_scale != 0.0f) {
+                    LOG_DEBUG("Skipping layers at step %d\n", step);
+                    if (!step_cache.is_step_skipped()) {
+                        guidance_input.predict_skip_layer = [&]() -> sd::Tensor<float> {
+                            return run_condition(cond,
+                                                 cond.c_concat.empty() ? nullptr : &cond.c_concat,
+                                                 &skip_layer_guidance.layers());
+                        };
+                    }
+                }
+
+                guided = skip_layer_guidance.forward(guidance_input, std::move(guided));
+                return std::move(guided.pred);
             };
 
-            const SDCondition* positive_condition      = &cond;
-            const sd::Tensor<float>* c_concat_override = nullptr;
-            for (const auto& extension : generation_extensions) {
-                const SDCondition& next_condition = extension->before_condition(step, *positive_condition);
-                if (&next_condition != positive_condition) {
-                    positive_condition = &next_condition;
-                    if (positive_condition != &cond) {
-                        c_concat_override = cond.c_concat.empty() ? nullptr : &cond.c_concat;
-                    }
-                    break;
-                }
+            sd::Tensor<float> pred;
+            if (use_diffusion_tiling) {
+                pred = process_tiles_2d(noised_input,
+                                        static_cast<int>(noised_input.shape()[0]),
+                                        static_cast<int>(noised_input.shape()[1]),
+                                        1,
+                                        diffusion_tile_size_x,
+                                        diffusion_tile_size_y,
+                                        diffusion_tile_overlap,
+                                        circular_x,
+                                        circular_y,
+                                        predict,
+                                        true);
+            } else {
+                pred = predict(noised_input);
             }
-
-            cond_out = run_condition(*positive_condition, c_concat_override);
-            if (cond_out.empty()) {
+            if (pred.empty()) {
                 return {};
             }
 
-            if (!uncond.empty()) {
-                if (!step_cache.is_step_skipped()) {
-                    compute_sample_controls(control_image,
-                                            noised_input,
-                                            timesteps_tensor,
-                                            uncond,
-                                            &controls);
-                }
-                const std::vector<int>* uncond_skip_layers = nullptr;
-                if (is_skiplayer_step && slg_uncond) {
-                    LOG_DEBUG("Skipping layers at uncond step %d\n", step);
-                    uncond_skip_layers = &skip_layer_guidance.layers();
-                }
-                uncond_out = run_condition(uncond,
-                                           uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
-                                           uncond_skip_layers,
-                                           nullptr,
-                                           true);
-                if (uncond_out.empty()) {
-                    return {};
-                }
-            }
-            if (!img_uncond.empty()) {
-                img_uncond_out = run_condition(img_uncond,
-                                               img_uncond.c_concat.empty() ? nullptr : &img_uncond.c_concat,
-                                               nullptr,
-                                               uncond_without_ref_latents ? &empty_ref_latents : nullptr,
-                                               true);
-                if (img_uncond_out.empty()) {
-                    return {};
-                }
-            }
-            sd::guidance::GuidanceInput guidance_input;
-            guidance_input.step            = step;
-            guidance_input.schedule_size   = sigmas.size();
-            guidance_input.pred_cond       = &cond_out;
-            guidance_input.pred_uncond     = uncond_out.empty() ? nullptr : &uncond_out;
-            guidance_input.pred_img_uncond = img_uncond_out.empty() ? nullptr : &img_uncond_out;
-
-            sd::guidance::GuiderOutput guided = guidance_schedule.empty() ? primary_guidance.forward(guidance_input, {}) : primary_guidance.forward(guidance_input, {}, guidance_schedule[guidance_schedule.size() - 1 - step]);
-            if (guided.pred.empty()) {
-                return {};
-            }
-
-            if (is_skiplayer_step && slg_scale != 0.0f) {
-                LOG_DEBUG("Skipping layers at step %d\n", step);
-                if (!step_cache.is_step_skipped()) {
-                    guidance_input.predict_skip_layer = [&]() -> sd::Tensor<float> {
-                        return run_condition(cond,
-                                             cond.c_concat.empty() ? nullptr : &cond.c_concat,
-                                             &skip_layer_guidance.layers());
-                    };
-                }
-            }
-
-            guided = skip_layer_guidance.forward(guidance_input, std::move(guided));
-            if (guided.pred.empty()) {
-                return {};
-            }
-
-            denoised = guided.pred * c_out + x * c_skip;
+            denoised = pred * c_out + x * c_skip;
             sd::guidance::GuiderOutput output;
             output.pred = denoised;
             if (needs_uncond_denoised) {
@@ -3710,22 +3796,27 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
 void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     *sd_img_gen_params = {};
     sd_sample_params_init(&sd_img_gen_params->sample_params);
-    sd_img_gen_params->clip_skip           = -1;
-    sd_img_gen_params->ref_images_count    = 0;
-    sd_img_gen_params->ref_image_args      = "";
-    sd_img_gen_params->width               = 512;
-    sd_img_gen_params->height              = 512;
-    sd_img_gen_params->strength            = 0.75f;
-    sd_img_gen_params->seed                = -1;
-    sd_img_gen_params->batch_count         = 1;
-    sd_img_gen_params->control_strength    = 0.9f;
-    sd_img_gen_params->ip_adapter_strength = 1.0f;
-    sd_img_gen_params->qwen_image_layers   = 3;
-    sd_img_gen_params->circular_x          = false;
-    sd_img_gen_params->circular_y          = false;
-    sd_img_gen_params->pm_params           = {nullptr, 0, nullptr, 20.f};
-    sd_img_gen_params->pulid_params        = {nullptr, 1.0f};
-    sd_img_gen_params->vae_tiling_params   = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    sd_img_gen_params->clip_skip               = -1;
+    sd_img_gen_params->ref_images_count        = 0;
+    sd_img_gen_params->ref_image_args          = "";
+    sd_img_gen_params->width                   = 512;
+    sd_img_gen_params->height                  = 512;
+    sd_img_gen_params->strength                = 0.75f;
+    sd_img_gen_params->seed                    = -1;
+    sd_img_gen_params->batch_count             = 1;
+    sd_img_gen_params->control_strength        = 0.9f;
+    sd_img_gen_params->ip_adapter_strength     = 1.0f;
+    sd_img_gen_params->qwen_image_layers       = 3;
+    sd_img_gen_params->circular_x              = false;
+    sd_img_gen_params->circular_y              = false;
+    sd_img_gen_params->pm_params               = {nullptr, 0, nullptr, 20.f};
+    sd_img_gen_params->pulid_params            = {nullptr, 1.0f};
+    sd_img_gen_params->vae_tiling_params       = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    sd_img_gen_params->diffusion_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    sd_img_gen_params->regions            = nullptr;
+    sd_img_gen_params->region_count       = 0;
+    sd_img_gen_params->region_base_weight = 1.0f;
+    sd_img_gen_params->region_feather     = 4.0f;
     sd_cache_params_init(&sd_img_gen_params->cache);
     sd_hires_params_init(&sd_img_gen_params->hires);
 }
@@ -3817,6 +3908,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->moe_boundary                          = 0.875f;
     sd_vid_gen_params->vace_strength                         = 1.f;
     sd_vid_gen_params->vae_tiling_params                     = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    sd_vid_gen_params->diffusion_tiling_params               = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     sd_vid_gen_params->hires.enabled                         = false;
     sd_vid_gen_params->hires.upscaler                        = SD_HIRES_UPSCALER_LATENT;
     sd_vid_gen_params->hires.scale                           = 2.f;
@@ -4079,9 +4171,36 @@ struct GenerationRequest {
     int fps                                  = 16;
     float vace_strength                      = 1.f;
 
+    struct RegionSpec {
+        std::string prompt;
+        float x      = 0.f;
+        float y      = 0.f;
+        float width  = 0.f;
+        float height = 0.f;
+        float weight = 1.f;
+    };
+    std::vector<RegionSpec> regions;
+    float region_base_weight                   = 1.f;
+    float region_feather                       = 4.f;
+    sd_tiling_params_t diffusion_tiling_params = {false, false, 0, 0, 0.5f, 0, 0, nullptr};
+
     GenerationRequest(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params) {
         prompt                      = SAFE_STR(sd_img_gen_params->prompt);
         negative_prompt             = SAFE_STR(sd_img_gen_params->negative_prompt);
+        diffusion_tiling_params     = sd_img_gen_params->diffusion_tiling_params;
+        region_base_weight          = sd_img_gen_params->region_base_weight;
+        region_feather              = sd_img_gen_params->region_feather;
+        for (int i = 0; i < sd_img_gen_params->region_count; i++) {
+            const sd_region_t& src = sd_img_gen_params->regions[i];
+            RegionSpec region;
+            region.prompt = SAFE_STR(src.prompt);
+            region.x      = src.x;
+            region.y      = src.y;
+            region.width  = src.width;
+            region.height = src.height;
+            region.weight = src.weight;
+            regions.push_back(std::move(region));
+        }
         width                       = sd_img_gen_params->width;
         height                      = sd_img_gen_params->height;
         vae_scale_factor            = sd_ctx->sd->get_vae_scale_factor();
@@ -4352,6 +4471,25 @@ struct SamplePlan {
                                                       sample_params->scheduler,
                                                       sample_method);
             int sample_seq_len    = sd_ctx->sd->get_image_seq_len(request->height, request->width);
+            if (request->diffusion_tiling_params.enabled) {
+                // Under tiled diffusion the model only ever sees one window, so a
+                // canvas-sized sequence length would shift the whole schedule toward
+                // noise levels no single model call actually operates at. Every window
+                // has the same size, so this stays a single shared schedule.
+                int vae_scale_factor = sd_ctx->sd->get_vae_scale_factor();
+                int tile_size_x, tile_size_y;
+                float tile_overlap;
+                sd::tiling::resolve_tile_sizes(tile_size_x,
+                                               tile_size_y,
+                                               tile_overlap,
+                                               request->diffusion_tiling_params,
+                                               request->width / vae_scale_factor,
+                                               request->height / vae_scale_factor,
+                                               1.0f,
+                                               sd::tiling::kDefaultDiffusionTileSize);
+                sample_seq_len = tile_size_x * tile_size_y;
+                LOG_DEBUG("tiled diffusion: sigma schedule uses window seq_len=%d", sample_seq_len);
+            }
             if (sd_version_is_ltxav(sd_ctx->sd->version) && request->frames > 0) {
                 int latent_frames = ((request->frames - 1) / 8) + 1;
                 sample_seq_len *= latent_frames;
@@ -4779,6 +4917,9 @@ struct ImageGenerationEmbeds {
     SDCondition cond;
     SDCondition uncond;
     SDCondition img_uncond;
+    std::vector<SDCondition> region_conds;
+    std::vector<sd::Tensor<float>> region_masks;
+    sd::Tensor<float> region_base_mask;
 };
 
 struct ConditionerRunnerDoneOnExit {
@@ -5292,13 +5433,46 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         }
     }
 
+    std::vector<SDCondition> region_conds;
+    std::vector<sd::Tensor<float>> region_masks;
+    sd::Tensor<float> region_base_mask;
+    if (!request->regions.empty()) {
+        int64_t latent_w = latents->init_latent.shape()[0];
+        int64_t latent_h = latents->init_latent.shape()[1];
+
+        for (const auto& region : request->regions) {
+            sd_region_t raw{region.prompt.c_str(), region.x, region.y, region.width, region.height, region.weight};
+            region_masks.push_back(sd::regional::rasterize_region(raw, request->region_feather, latent_w, latent_h));
+
+            condition_params.text            = region.prompt;
+            condition_params.zero_out_masked = false;
+            SDCondition region_cond          = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
+                                                                                                   condition_params);
+            if (region_cond.c_concat.empty() && ref_image_params.pass_to_dit) {
+                region_cond.c_concat = latents->concat_latent;
+            }
+            region_conds.push_back(std::move(region_cond));
+        }
+
+        region_base_mask = sd::Tensor<float>::zeros({latent_w, latent_h, 1, 1});
+        region_base_mask.fill_(request->region_base_weight);
+        sd::regional::normalize_region_weights(region_masks, region_base_mask);
+        LOG_INFO("regional prompting: %zu regions, base weight %.2f, feather %.1f",
+                 region_conds.size(),
+                 request->region_base_weight,
+                 request->region_feather);
+    }
+
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
     ImageGenerationEmbeds embeds;
-    embeds.img_uncond = std::move(img_uncond);
-    embeds.cond       = std::move(cond);
-    embeds.uncond     = std::move(uncond);
+    embeds.img_uncond      = std::move(img_uncond);
+    embeds.cond            = std::move(cond);
+    embeds.uncond          = std::move(uncond);
+    embeds.region_conds    = std::move(region_conds);
+    embeds.region_masks    = std::move(region_masks);
+    embeds.region_base_mask = std::move(region_base_mask);
 
     return embeds;
 }
@@ -5622,8 +5796,9 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
 
     sd_ctx->sd->reset_cancel_flag();
 
-    int64_t t0                    = ggml_time_ms();
-    sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
+    int64_t t0                          = ggml_time_ms();
+    sd_ctx->sd->vae_tiling_params       = sd_img_gen_params->vae_tiling_params;
+    sd_ctx->sd->diffusion_tiling_params = sd_img_gen_params->diffusion_tiling_params;
     GenerationRequest request(sd_ctx, sd_img_gen_params);
     LOG_INFO("generate_image %dx%d", request.width, request.height);
 
@@ -5705,7 +5880,11 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
                                                    1.f,
                                                    0,
                                                    static_cast<float>(request.fps),
-                                                   request.cache_params);
+                                                   request.cache_params,
+                                                   sd::Tensor<float>(),
+                                                   embeds.region_conds,
+                                                   embeds.region_masks,
+                                                   embeds.region_base_mask);
         int64_t sampling_end  = ggml_time_ms();
         if (!x_0.empty()) {
             LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
@@ -6813,25 +6992,26 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
 
     sd_img_gen_params_t img_gen_params;
     sd_img_gen_params_init(&img_gen_params);
-    img_gen_params.loras             = sd_vid_gen_params->loras;
-    img_gen_params.lora_count        = sd_vid_gen_params->lora_count;
-    img_gen_params.prompt            = sd_vid_gen_params->prompt;
-    img_gen_params.negative_prompt   = sd_vid_gen_params->negative_prompt;
-    img_gen_params.clip_skip         = sd_vid_gen_params->clip_skip;
-    img_gen_params.width             = sd_vid_gen_params->width;
-    img_gen_params.height            = sd_vid_gen_params->height;
-    img_gen_params.sample_params     = sd_vid_gen_params->sample_params;
-    img_gen_params.strength          = sd_vid_gen_params->strength;
-    img_gen_params.init_image        = sd_vid_gen_params->init_image;
-    img_gen_params.seed              = sd_vid_gen_params->seed;
-    img_gen_params.batch_count       = 1;
-    img_gen_params.control_strength  = 1.0f;
-    img_gen_params.vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
-    img_gen_params.cache             = sd_vid_gen_params->cache;
-    img_gen_params.hires             = sd_vid_gen_params->hires;
-    img_gen_params.qwen_image_layers = 0;
-    img_gen_params.circular_x        = sd_vid_gen_params->circular_x;
-    img_gen_params.circular_y        = sd_vid_gen_params->circular_y;
+    img_gen_params.loras                   = sd_vid_gen_params->loras;
+    img_gen_params.lora_count              = sd_vid_gen_params->lora_count;
+    img_gen_params.prompt                  = sd_vid_gen_params->prompt;
+    img_gen_params.negative_prompt         = sd_vid_gen_params->negative_prompt;
+    img_gen_params.clip_skip               = sd_vid_gen_params->clip_skip;
+    img_gen_params.width                   = sd_vid_gen_params->width;
+    img_gen_params.height                  = sd_vid_gen_params->height;
+    img_gen_params.sample_params           = sd_vid_gen_params->sample_params;
+    img_gen_params.strength                = sd_vid_gen_params->strength;
+    img_gen_params.init_image              = sd_vid_gen_params->init_image;
+    img_gen_params.seed                    = sd_vid_gen_params->seed;
+    img_gen_params.batch_count             = 1;
+    img_gen_params.control_strength        = 1.0f;
+    img_gen_params.vae_tiling_params       = sd_vid_gen_params->vae_tiling_params;
+    img_gen_params.diffusion_tiling_params = sd_vid_gen_params->diffusion_tiling_params;
+    img_gen_params.cache                   = sd_vid_gen_params->cache;
+    img_gen_params.hires                   = sd_vid_gen_params->hires;
+    img_gen_params.qwen_image_layers       = 0;
+    img_gen_params.circular_x              = sd_vid_gen_params->circular_x;
+    img_gen_params.circular_y              = sd_vid_gen_params->circular_y;
 
     sd_ctx->sd->animatediff_num_frames = n_frames;
     bool ok                            = generate_image(sd_ctx, &img_gen_params, frames_out, num_frames_out);
@@ -6867,8 +7047,9 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
 
     const RefImageParams ref_image_params;
 
-    int64_t t0                    = ggml_time_ms();
-    sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
+    int64_t t0                          = ggml_time_ms();
+    sd_ctx->sd->vae_tiling_params       = sd_vid_gen_params->vae_tiling_params;
+    sd_ctx->sd->diffusion_tiling_params = sd_vid_gen_params->diffusion_tiling_params;
     apply_circular_axes_to_diffusion(sd_ctx, sd_vid_gen_params->circular_x, sd_vid_gen_params->circular_y);
     GenerationRequest request(sd_ctx, sd_vid_gen_params);
     bool latent_upscale_enabled     = request.hires.enabled;

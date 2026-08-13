@@ -1402,6 +1402,7 @@ namespace Flux {
         std::vector<float> mod_index_arange_vec;
         std::vector<float> dct_vec;
         sd::Tensor<float> guidance_tensor;
+        LatentWindow window;
         SDVersion version;
         bool use_mask = true;
 
@@ -1558,7 +1559,9 @@ namespace Flux {
                                             circular_y_enabled,
                                             circular_x_enabled,
                                             config.axes_dim,
-                                            sd_version_is_longcat(version));
+                                            sd_version_is_longcat(version),
+                                            static_cast<int>(window.y_offset) / config.patch_size,
+                                            static_cast<int>(window.x_offset) / config.patch_size);
             int pos_len = static_cast<int>(pe_vec.size() / config.axes_dim_sum / 2);
             // LOG_DEBUG("pos_len %d", pos_len);
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.axes_dim_sum / 2, pos_len);
@@ -1635,6 +1638,7 @@ namespace Flux {
             GGML_ASSERT(diffusion_params.x != nullptr);
             GGML_ASSERT(diffusion_params.timesteps != nullptr);
             const auto* extra = diffusion_extra_as<FluxDiffusionExtra>(diffusion_params);
+            window            = diffusion_params.window;
             static const std::vector<sd::Tensor<float>> empty_ref_latents;
             static const std::vector<int> empty_skip_layers;
             return compute(n_threads,

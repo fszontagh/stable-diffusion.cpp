@@ -4,6 +4,7 @@
 #include "core/tensor_ggml.hpp"
 #include "model/common/block.hpp"
 #include "model_manager.h"
+#include "runtime/tiled_diffusion.hpp"
 
 struct VAE : public GGMLRunner {
 protected:
@@ -93,26 +94,13 @@ public:
                         int64_t latent_x,
                         int64_t latent_y,
                         float encoding_factor = 1.0f) {
-        tile_overlap       = std::max(std::min(params.target_overlap, 0.5f), 0.0f);
-        auto get_tile_size = [&](int requested_size, float factor, int64_t latent_size) {
-            const int default_tile_size  = 32;
-            const int min_tile_dimension = 4;
-            int tile_size                = default_tile_size;
-            // factor <= 1 means simple fraction of the latent dimension
-            // factor > 1 means number of tiles across that dimension
-            if (factor > 0.f) {
-                if (factor > 1.0)
-                    factor = 1 / (factor - factor * tile_overlap + tile_overlap);
-                tile_size = static_cast<int>(std::round(latent_size * factor));
-            } else if (requested_size >= min_tile_dimension) {
-                tile_size = requested_size;
-            }
-            tile_size = static_cast<int>(tile_size * encoding_factor);
-            return std::max(std::min(tile_size, static_cast<int>(latent_size)), min_tile_dimension);
-        };
-
-        tile_size_x = get_tile_size(params.tile_size_x, params.rel_size_x, latent_x);
-        tile_size_y = get_tile_size(params.tile_size_y, params.rel_size_y, latent_y);
+        sd::tiling::resolve_tile_sizes(tile_size_x,
+                                       tile_size_y,
+                                       tile_overlap,
+                                       params,
+                                       latent_x,
+                                       latent_y,
+                                       encoding_factor);
     }
 
     virtual sd::Tensor<float> encode(int n_threads,
