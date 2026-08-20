@@ -1039,6 +1039,38 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
     return x;
 }
 
+__STATIC_INLINE__ ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
+                                                             ggml_tensor* x,
+                                                             ggml_tensor* w,
+                                                             ggml_tensor* weight_scale,
+                                                             ggml_tensor* b,
+                                                             int convrot_group_size,
+                                                             float scale = 1.f) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || (x->type == GGML_TYPE_I8 && scale == 1.f));
+    if (scale != 1.f) {
+        x = ggml_ext_scale(ctx, x, scale);
+    }
+
+    ggml_tensor* fused_bias = scale == 1.f ? b : nullptr;
+    if (x->ne[2] * x->ne[3] > 1024) {
+        int64_t ne2 = x->ne[2];
+        int64_t ne3 = x->ne[3];
+        x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
+        x           = ggml_mul_mat_i8_tensorwise(ctx, w, x, weight_scale, fused_bias, convrot_group_size);
+        x           = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
+    } else {
+        x = ggml_mul_mat_i8_tensorwise(ctx, w, x, weight_scale, fused_bias, convrot_group_size);
+    }
+
+    if (scale != 1.f) {
+        x = ggml_ext_scale(ctx, x, 1.f / scale);
+        if (b != nullptr) {
+            x = ggml_add_inplace(ctx, x, b);
+        }
+    }
+    return x;
+}
+
 __STATIC_INLINE__ ggml_tensor* ggml_ext_pad_ext(ggml_context* ctx,
                                                 ggml_backend_t backend,
                                                 ggml_tensor* x,
@@ -1679,6 +1711,13 @@ struct WeightAdapter {
                                            ggml_tensor* b,
                                            const std::string& prefix,
                                            ForwardParams forward_params)                                                              = 0;
+    virtual ggml_tensor* add_lora_to_output(ggml_context* ctx,
+                                            ggml_backend_t backend,
+                                            ggml_tensor* x,
+                                            ggml_tensor* w,
+                                            ggml_tensor* output,
+                                            const std::string& prefix,
+                                            ForwardParams forward_params)                                                             = 0;
     virtual size_t get_extra_graph_size()                                                                                             = 0;
 };
 
@@ -1689,11 +1728,14 @@ struct GGMLRunnerContext {
     bool conv2d_direct_enabled                                       = false;
     bool circular_x_enabled                                          = false;
     bool circular_y_enabled                                          = false;
+    ggml_tensor* ip_context                                          = nullptr;
+    float ip_scale                                                   = 1.0f;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
     std::function<void(ggml_tensor*, const void*)> set_backend_tensor_data;
+    std::map<std::pair<ggml_tensor*, int>, ggml_tensor*> int8_convrot_cache;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {
@@ -1751,8 +1793,9 @@ protected:
     std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
 
     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
-    ggml_backend_sched_t sched             = nullptr;    // owned, multi-device only
-    ggml_backend_t cpu_fallback_backend    = nullptr;    // owned, sched requires a trailing CPU backend
+    ggml_backend_sched_t sched             = nullptr;    // owned
+    size_t sched_graph_capacity            = 0;
+    ggml_backend_t cpu_fallback_backend    = nullptr;  // owned, sched requires a trailing CPU backend
     bool multi_device_eval_callback_warned = false;
 
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
@@ -2038,8 +2081,18 @@ protected:
     // Pass explicit buffer types: synthesized defaults can make CUDA devices
     // report supporting each other's buffers and skip a required copy.
     bool ensure_sched(ggml_cgraph* gf) {
-        if (sched != nullptr) {
+        const size_t required_graph_size = gf != nullptr
+                                               ? std::max<size_t>(1,
+                                                                  (size_t)ggml_graph_n_nodes(gf) +
+                                                                      sd::ggml_graph_cut::leaf_count(gf))
+                                               : 1;
+        if (sched != nullptr && sched_graph_capacity >= required_graph_size) {
             return true;
+        }
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+            sched                = nullptr;
+            sched_graph_capacity = 0;
         }
         std::vector<ggml_backend_t> backends;
         backends.reserve(extra_runtime_backends.size() + 2);
@@ -2068,20 +2121,17 @@ protected:
             bufts.push_back(buft);
         }
 
-        size_t graph_size = MAX_GRAPH_SIZE;
-        if (gf != nullptr) {
-            graph_size = std::max<size_t>(graph_size, (size_t)ggml_graph_n_nodes(gf));
-        }
         sched = ggml_backend_sched_new(backends.data(),
                                        bufts.data(),
                                        (int)backends.size(),
-                                       graph_size,
+                                       required_graph_size,
                                        /*parallel=*/false,
                                        /*op_offload=*/false);
         if (sched == nullptr) {
             LOG_ERROR("%s: failed to create backend sched", get_desc().c_str());
             return false;
         }
+        sched_graph_capacity = required_graph_size;
         return true;
     }
 
@@ -2145,8 +2195,22 @@ protected:
         return !extra_runtime_backends.empty();
     }
 
+    bool graph_requires_backend_fallback(ggml_cgraph* gf) const {
+        if (gf == nullptr || sd_backend_is_cpu(runtime_backend)) {
+            return false;
+        }
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (node != nullptr && !ggml_backend_supports_op(runtime_backend, node)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool alloc_compute_buffer(ggml_cgraph* gf) {
-        if (is_multi_device()) {
+        if (sched != nullptr || is_multi_device() || graph_requires_backend_fallback(gf)) {
             // The sched replaces the gallocr. Do NOT ggml_backend_sched_reserve
             // the graph here: reserve runs split_graph, which rewires the
             // graph's src pointers to sched-internal copy tensors, and the
@@ -2154,6 +2218,10 @@ protected:
             // rewired graph, silently corrupting every cross-backend input. A
             // graph must be split at most once; the alloc in execute_graph
             // performs the real allocation.
+            if (compute_allocr != nullptr) {
+                ggml_gallocr_free(compute_allocr);
+                compute_allocr = nullptr;
+            }
             return ensure_sched(gf);
         }
         if (compute_allocr != nullptr) {
@@ -2388,13 +2456,14 @@ protected:
         GGML_ASSERT(gf != nullptr);
 
         size_t effective_budget = max_graph_vram_bytes;
+        size_t free_clamp       = SIZE_MAX;
         if (stream_layers_enabled && max_graph_vram_bytes > 0 && runtime_backend != nullptr) {
             ggml_backend_dev_t dev = ggml_backend_get_device(runtime_backend);
             if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 size_t free_vram = 0, total_vram = 0;
                 ggml_backend_dev_memory(dev, &free_vram, &total_vram);
                 constexpr size_t safety_margin = 512ull * 1024 * 1024;
-                size_t free_clamp              = (free_vram > safety_margin) ? (free_vram - safety_margin) : 0;
+                free_clamp                     = (free_vram > safety_margin) ? (free_vram - safety_margin) : 0;
                 if (free_clamp < effective_budget) {
                     LOG_DEBUG("%s clamping streaming budget: actual free VRAM %.2f MB < user cap %.2f MB",
                               get_desc().c_str(),
@@ -2411,7 +2480,9 @@ protected:
                 observed_max_effective_budget_ = effective_budget;
                 budget_increased               = true;
             } else {
-                effective_budget = observed_max_effective_budget_;
+                // Keep the plan cache stable, but never plan above what is free now:
+                // another model or process can take VRAM after the first measurement.
+                effective_budget = std::min(observed_max_effective_budget_, free_clamp);
             }
         }
 
@@ -2751,7 +2822,7 @@ protected:
         };
         ComputeBufferGuard compute_buffer_guard(this, free_compute_buffer);
 
-        if (is_multi_device()) {
+        if (sched != nullptr) {
             ggml_backend_sched_reset(sched);
             pin_multi_device_nodes(gf);  // reset clears the pins; re-apply before alloc
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
@@ -2772,9 +2843,9 @@ protected:
         }
 
         ggml_status status;
-        if (is_multi_device()) {
+        if (sched != nullptr) {
             if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
-                LOG_WARN("%s: eval callback is not supported with multiple runtime backends; ignoring",
+                LOG_WARN("%s: eval callback is not supported with the backend scheduler; ignoring",
                          get_desc().c_str());
                 multi_device_eval_callback_warned = true;
             }
@@ -3010,18 +3081,16 @@ public:
         }
         if (sched != nullptr) {
             ggml_backend_sched_free(sched);
-            sched = nullptr;
+            sched                = nullptr;
+            sched_graph_capacity = 0;
         }
     }
 
     // do copy after alloc graph
     void set_backend_tensor_data(ggml_tensor* tensor, const void* data) {
-        if (is_multi_device()) {
-            // The sched only assigns a backend (and thus a buffer) to tensors
-            // that participate in the graph; flag standalone data tensors as
-            // inputs so they get one.
-            ggml_set_input(tensor);
-        }
+        // The scheduler only allocates standalone data tensors when they are
+        // marked as graph inputs. The flag is harmless for single-backend graphs.
+        ggml_set_input(tensor);
         backend_tensor_data_map[tensor] = data;
     }
 
@@ -3238,6 +3307,11 @@ protected:
 
     virtual void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") {}
 
+    virtual enum ggml_op param_usage_op(const std::string& name) const {
+        (void)name;
+        return GGML_OP_NONE;
+    }
+
 public:
     void init(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, std::string prefix = "") {
         if (prefix.size() > 0) {
@@ -3288,6 +3362,18 @@ public:
         }
     }
 
+    void get_param_tensor_ops(std::map<ggml_tensor*, enum ggml_op>& tensor_ops) {
+        for (auto& pair : blocks) {
+            pair.second->get_param_tensor_ops(tensor_ops);
+        }
+        for (auto& pair : params) {
+            enum ggml_op op = param_usage_op(pair.first);
+            if (op != GGML_OP_NONE) {
+                tensor_ops[pair.second] = op;
+            }
+        }
+    }
+
     virtual std::string get_desc() {
         return "GGMLBlock";
     }
@@ -3322,14 +3408,18 @@ protected:
     bool force_f32;
     bool force_prec_f32;
     bool allow_weight_scale;
-    bool has_weight_scale = false;
+    bool has_weight_scale       = false;
+    bool int8_convrot           = false;
+    int int8_convrot_group_size = 0;
     float scale;
     std::string prefix;
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
-        this->prefix         = prefix;
-        has_weight_scale     = false;
-        enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
+        this->prefix            = prefix;
+        has_weight_scale        = false;
+        int8_convrot            = false;
+        int8_convrot_group_size = 0;
+        enum ggml_type wtype    = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
         if (in_features % ggml_blck_size(wtype) != 0 || force_f32) {
             wtype = GGML_TYPE_F32;
         }
@@ -3338,9 +3428,17 @@ protected:
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_features);
         }
-        if (allow_weight_scale && tensor_storage_map.find(prefix + "weight_scale") != tensor_storage_map.end()) {
+        auto weight_storage           = tensor_storage_map.find(prefix + "weight");
+        const bool is_int8_tensorwise = weight_storage != tensor_storage_map.end() && weight_storage->second.is_int8_tensorwise;
+        if ((allow_weight_scale || is_int8_tensorwise) && tensor_storage_map.find(prefix + "weight_scale") != tensor_storage_map.end()) {
             params["weight_scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_features);
             has_weight_scale       = true;
+        }
+        if (is_int8_tensorwise) {
+            GGML_ASSERT(wtype == GGML_TYPE_I8);
+            GGML_ASSERT(has_weight_scale);
+            int8_convrot            = weight_storage->second.int8_convrot;
+            int8_convrot_group_size = weight_storage->second.int8_convrot_group_size;
         }
     }
 
@@ -3376,6 +3474,49 @@ public:
         }
         ggml_tensor* linear_bias = has_weight_scale ? nullptr : b;
         ggml_tensor* out         = nullptr;
+        if (w->type == GGML_TYPE_I8) {
+            if (x->type != GGML_TYPE_F32) {
+                x = ggml_ext_cast_f32(ctx->ggml_ctx, ctx->backend, x);
+            }
+            if (!ggml_is_contiguous(x)) {
+                x = ggml_cont(ctx->ggml_ctx, x);
+            }
+            ggml_tensor* lora_input = x;
+            if (ctx->weight_adapter && b != nullptr) {
+                b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
+            }
+            if (int8_convrot && scale == 1.f) {
+                const auto cache_key = std::make_pair(x, int8_convrot_group_size);
+                auto cached          = ctx->int8_convrot_cache.find(cache_key);
+                if (cached == ctx->int8_convrot_cache.end()) {
+                    x = ggml_quantize_i8_convrot(ctx->ggml_ctx, x, int8_convrot_group_size);
+                    ctx->int8_convrot_cache.emplace(cache_key, x);
+                } else {
+                    x = cached->second;
+                }
+            }
+            out = ggml_ext_linear_i8_tensorwise(ctx->ggml_ctx,
+                                                x,
+                                                w,
+                                                params["weight_scale"],
+                                                b,
+                                                int8_convrot ? int8_convrot_group_size : 0,
+                                                scale);
+            if (ctx->weight_adapter) {
+                WeightAdapter::ForwardParams forward_params;
+                forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
+                forward_params.linear.force_prec_f32 = force_prec_f32;
+                forward_params.linear.scale          = scale;
+                out                                  = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx,
+                                                                                               ctx->backend,
+                                                                                               lora_input,
+                                                                                               w,
+                                                                                               out,
+                                                                                               prefix,
+                                                                                               forward_params);
+            }
+            return out;
+        }
         if (ctx->weight_adapter) {
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
@@ -3413,6 +3554,10 @@ protected:
             wtype = GGML_TYPE_F32;
         }
         params["weight"] = ggml_new_tensor_2d(ctx, wtype, embedding_dim, num_embeddings);
+    }
+
+    enum ggml_op param_usage_op(const std::string& name) const override {
+        return name == "weight" ? GGML_OP_GET_ROWS : GGML_OP_NONE;
     }
 
 public:

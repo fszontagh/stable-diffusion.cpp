@@ -428,6 +428,11 @@ ArgOptions SDContextParams::get_options() {
          0,
          &control_net_path},
         {"",
+         "--ip-adapter",
+         "path to IP-Adapter model (requires --clip_vision)",
+         0,
+         &ip_adapter_path},
+        {"",
          "--motion-module",
          "path to AnimateDiff motion module (SD 1.5); enables video generation on --video-frames > 1",
          0,
@@ -876,6 +881,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.audio_vae_path                  = audio_vae_path.c_str();
     sd_ctx_params.taesd_path                      = taesd_path.c_str();
     sd_ctx_params.control_net_path                = control_net_path.c_str();
+    sd_ctx_params.ip_adapter_path                 = ip_adapter_path.c_str();
     sd_ctx_params.motion_module_path              = motion_module_path.c_str();
     sd_ctx_params.embeddings                      = embedding_vec.data();
     sd_ctx_params.embedding_count                 = static_cast<uint32_t>(embedding_vec.size());
@@ -967,6 +973,11 @@ ArgOptions SDGenerationParams::get_options() {
          0,
          &control_image_path},
         {"",
+         "--ip-adapter-image",
+         "path to the IP-Adapter reference image",
+         0,
+         &ip_adapter_image_path},
+        {"",
          "--control-video",
          "path to control video frames, It must be a directory path. The video frames inside should be stored as images in "
          "lexicographical (character) order. For example, if the control video path is `frames`, the directory contain images "
@@ -997,7 +1008,7 @@ ArgOptions SDGenerationParams::get_options() {
          &hires_upscaler},
         {"",
          "--extra-sample-args",
-         "extra sampler/scheduler/guidance args, key=value list. CFG supports guidance_schedule; APG supports apg_eta, apg_momentum, apg_norm_threshold, apg_norm_threshold_smoothing; SLG supports slg_uncond; lcm supports noise_clip_std, noise_scale_start, noise_scale_end; flux supports base_shift, max_shift; ltx2 supports max_shift, base_shift, stretch, terminal; euler_ge supports gamma; speed_flow supports speed_scales (use ':' between scales, e.g. speed_scales=0.25:0.5:1.0), speed_levels (2 or 3), speed_delta, speed_manual_sigmas (':'-separated, one per transition, overrides delta), speed_preset (flux|wan21), speed_transform (dct|fft), speed_A, speed_beta, speed_seed;; logit_normal supports mu, std, logsnr_min, logsnr_max, resolution_aware",
+         "extra sampler/scheduler/guidance args, key=value list. CFG supports guidance_schedule; APG supports apg_eta, apg_momentum, apg_norm_threshold, apg_norm_threshold_smoothing; SLG supports slg_uncond; lcm supports noise_clip_std, noise_scale_start, noise_scale_end; flux supports base_shift, max_shift; ltx2 supports max_shift, base_shift, stretch, terminal; euler_ge supports gamma; beta scheduler supports alpha, beta; speed_flow supports speed_scales (use ':' between scales, e.g. speed_scales=0.25:0.5:1.0), speed_levels (2 or 3), speed_delta, speed_manual_sigmas (':'-separated, one per transition, overrides delta), speed_preset (flux|wan21), speed_transform (dct|fft), speed_A, speed_beta, speed_seed; logit_normal supports mu, std, logsnr_min, logsnr_max, resolution_aware; lms supports lms_max_order, lms_shift, lms_divisions",
          (int)',',
          &extra_sample_args},
         {"",
@@ -1158,6 +1169,10 @@ ArgOptions SDGenerationParams::get_options() {
          "--control-strength",
          "strength to apply Control Net (default: 0.9). 1.0 corresponds to full destruction of information in init image",
          &control_strength},
+        {"",
+         "--ip-adapter-strength",
+         "strength to apply IP-Adapter (default: 1.0)",
+         &ip_adapter_strength},
         {"",
          "--moe-boundary",
          "timestep boundary for Wan2.2 MoE model. (default: 0.875). Only enabled if `--high-noise-steps` is set to -1",
@@ -1389,6 +1404,30 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    auto on_ref_video_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        ref_video_paths.push_back(argv[index]);
+        return 1;
+    };
+
+    auto on_ref_video_audio_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        ref_video_audio_paths.push_back(argv[index]);
+        return 1;
+    };
+
+    auto on_ref_audio_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        ref_audio_paths.push_back(argv[index]);
+        return 1;
+    };
+
     auto on_cache_mode_arg = [&](int argc, const char** argv, int index) {
         if (++index >= argc) {
             return -1;
@@ -1516,6 +1555,16 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    std::string sample_methods = sample_method_to_str[0];
+    for (int i = 1; i < SAMPLE_METHOD_COUNT; i++) {
+        sample_methods += ", " + std::string(sample_method_to_str[i]);
+    }
+
+    std::string schedulers = scheduler_to_str[0];
+    for (int i = 1; i < SCHEDULER_COUNT; i++) {
+        schedulers += ", " + std::string(scheduler_to_str[i]);
+    }
+
     options.manual_options = {
         {"-s",
          "--seed",
@@ -1523,17 +1572,18 @@ ArgOptions SDGenerationParams::get_options() {
          on_seed_arg},
         {"",
          "--sampling-method",
-         "sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, dpm++2m_sde, dpm++2m_sde_bt, speed_flow, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp]"
-         "(default: euler for Flux/SD3/Wan, euler_a otherwise)",
+         "sampling method, one of [" + sample_methods + "], "
+                                                        "default: euler for Flux/SD3/Wan, euler_a otherwise",
          on_sample_method_arg},
         {"",
          "--high-noise-sampling-method",
-         "(high noise) sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, dpm++2m_sde, dpm++2m_sde_bt, speed_flow, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp]"
-         " default: euler for Flux/SD3/Wan, euler_a otherwise",
+         "(high noise) sampling method, one of [" + sample_methods + "], "
+                                                                     "default: euler for Flux/SD3/Wan, euler_a otherwise",
          on_high_noise_sample_method_arg},
         {"",
          "--scheduler",
-         "denoiser sigma scheduler, one of [discrete, karras, exponential, ays, gits, smoothstep, sgm_uniform, simple, kl_optimal, lcm, bong_tangent, ltx2, logit_normal, flux2, flux, beta], alias: normal=discrete, default: model-specific",
+         "denoiser sigma scheduler, one of [" + schedulers + "], "
+                                                             "alias: normal=discrete, default: model-specific",
          on_scheduler_arg},
         {"",
          "--sigmas",
@@ -1553,8 +1603,20 @@ ArgOptions SDGenerationParams::get_options() {
          on_high_noise_skip_layers_arg},
         {"-r",
          "--ref-image",
-         "reference image for Flux Kontext models (can be used multiple times)",
+         "reference image for Flux Kontext or MiniMax-H3 Ref2VA (can be used multiple times)",
          on_ref_image_arg},
+        {"",
+         "--ref-video",
+         "MiniMax-H3 Ref2VA reference video frame directory at 24 fps (can be used multiple times)",
+         on_ref_video_arg},
+        {"",
+         "--ref-video-audio",
+         "WAV soundtrack paired by index with --ref-video (can be used multiple times)",
+         on_ref_video_audio_arg},
+        {"",
+         "--ref-audio",
+         "standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)",
+         on_ref_audio_arg},
         {"",
          "--cache-mode",
          "caching method: 'easycache' (DiT), 'ucache' (UNET), 'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (UNET/DiT Chebyshev+Taylor forecasting)",
@@ -1886,6 +1948,7 @@ bool SDGenerationParams::from_json_str(
 
     load_if_exists("strength", strength);
     load_if_exists("control_strength", control_strength);
+    load_if_exists("ip_adapter_strength", ip_adapter_strength);
     load_if_exists("moe_boundary", moe_boundary);
     load_if_exists("vace_strength", vace_strength);
 
@@ -2055,6 +2118,10 @@ bool SDGenerationParams::from_json_str(
     }
     if (!parse_image_json_field(j, "control_image", 3, width, height, control_image)) {
         LOG_ERROR("invalid control_image");
+        return false;
+    }
+    if (!parse_image_json_field(j, "ip_adapter_image", 3, width, height, ip_adapter_image)) {
+        LOG_ERROR("invalid ip_adapter_image");
         return false;
     }
 
@@ -2346,6 +2413,16 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
+    if (ref_video_audio_paths.size() > ref_video_paths.size()) {
+        LOG_ERROR("error: each --ref-video-audio needs a corresponding --ref-video");
+        return false;
+    }
+
+    if (mode != VID_GEN && (!ref_video_paths.empty() || !ref_video_audio_paths.empty() || !ref_audio_paths.empty())) {
+        LOG_ERROR("error: reference video and audio inputs require vid_gen mode");
+        return false;
+    }
+
     if (sample_params.shifted_timestep < 0 || sample_params.shifted_timestep > 1000) {
         LOG_ERROR("error: shifted_timestep must be in range [0, 1000]");
         return false;
@@ -2479,29 +2556,31 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
         LOG_WARN("Notice: --increase-ref-index is deprecated. Use --ref-image-args \"ref_index_mode=increase\" instead.");
     }
 
-    params.loras             = lora_vec.empty() ? nullptr : lora_vec.data();
-    params.lora_count        = static_cast<uint32_t>(lora_vec.size());
-    params.prompt            = prompt.c_str();
-    params.negative_prompt   = negative_prompt.c_str();
-    params.clip_skip         = clip_skip;
-    params.init_image        = init_image.get();
-    params.ref_images        = ref_image_views.empty() ? nullptr : ref_image_views.data();
-    params.ref_images_count  = static_cast<int>(ref_image_views.size());
-    params.ref_image_args    = ref_image_args.c_str();
-    params.mask_image        = mask_image.get();
-    params.width             = get_resolved_width();
-    params.height            = get_resolved_height();
-    params.sample_params     = sample_params;
-    params.strength          = strength;
-    params.seed              = seed;
-    params.batch_count       = batch_count;
-    params.qwen_image_layers = qwen_image_layers;
-    params.control_image     = control_image.get();
-    params.control_strength  = control_strength;
-    params.pm_params         = pm_params;
-    params.pulid_params      = pulid_params;
-    params.vae_tiling_params = vae_tiling_params;
-    params.cache             = cache_params;
+    params.loras               = lora_vec.empty() ? nullptr : lora_vec.data();
+    params.lora_count          = static_cast<uint32_t>(lora_vec.size());
+    params.prompt              = prompt.c_str();
+    params.negative_prompt     = negative_prompt.c_str();
+    params.clip_skip           = clip_skip;
+    params.init_image          = init_image.get();
+    params.ref_images          = ref_image_views.empty() ? nullptr : ref_image_views.data();
+    params.ref_images_count    = static_cast<int>(ref_image_views.size());
+    params.ref_image_args      = ref_image_args.c_str();
+    params.mask_image          = mask_image.get();
+    params.width               = get_resolved_width();
+    params.height              = get_resolved_height();
+    params.sample_params       = sample_params;
+    params.strength            = strength;
+    params.seed                = seed;
+    params.batch_count         = batch_count;
+    params.qwen_image_layers   = qwen_image_layers;
+    params.control_image       = control_image.get();
+    params.control_strength    = control_strength;
+    params.ip_adapter_image    = ip_adapter_image.get();
+    params.ip_adapter_strength = ip_adapter_strength;
+    params.pm_params           = pm_params;
+    params.pulid_params        = pulid_params;
+    params.vae_tiling_params   = vae_tiling_params;
+    params.cache               = cache_params;
 
     params.hires.enabled             = hires_enabled;
     params.hires.upscaler            = resolved_hires_upscaler;
@@ -2538,6 +2617,35 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
         control_frame_views.push_back(frame.get());
     }
 
+    ref_image_views.clear();
+    ref_image_views.reserve(ref_images.size());
+    for (auto& image : ref_images) {
+        ref_image_views.push_back(image.get());
+    }
+
+    ref_video_frame_views.clear();
+    ref_video_frame_views.resize(ref_videos.size());
+    ref_video_views.clear();
+    ref_video_views.reserve(ref_videos.size());
+    for (size_t i = 0; i < ref_videos.size(); ++i) {
+        auto& frame_views = ref_video_frame_views[i];
+        frame_views.reserve(ref_videos[i].size());
+        for (auto& frame : ref_videos[i]) {
+            frame_views.push_back(frame.get());
+        }
+        sd_audio_t audio = i < ref_video_audios.size() ? ref_video_audios[i].get() : sd_audio_t{};
+        ref_video_views.push_back({frame_views.empty() ? nullptr : frame_views.data(),
+                                   static_cast<int>(frame_views.size()),
+                                   24,
+                                   audio});
+    }
+
+    ref_audio_views.clear();
+    ref_audio_views.reserve(ref_audios.size());
+    for (auto& audio : ref_audios) {
+        ref_audio_views.push_back(audio.get());
+    }
+
     sample_params.guidance.slg.layers                 = skip_layers.empty() ? nullptr : skip_layers.data();
     sample_params.guidance.slg.layer_count            = skip_layers.size();
     high_noise_sample_params.guidance.slg.layers      = high_noise_skip_layers.empty() ? nullptr : high_noise_skip_layers.data();
@@ -2556,6 +2664,12 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.clip_skip                 = clip_skip;
     params.init_image                = init_image.get();
     params.end_image                 = end_image.get();
+    params.ref_images                = ref_image_views.empty() ? nullptr : ref_image_views.data();
+    params.ref_images_count          = static_cast<int>(ref_image_views.size());
+    params.ref_videos                = ref_video_views.empty() ? nullptr : ref_video_views.data();
+    params.ref_videos_count          = static_cast<int>(ref_video_views.size());
+    params.ref_audios                = ref_audio_views.empty() ? nullptr : ref_audio_views.data();
+    params.ref_audios_count          = static_cast<int>(ref_audio_views.size());
     params.control_frames            = control_frame_views.empty() ? nullptr : control_frame_views.data();
     params.control_frames_size       = static_cast<int>(control_frame_views.size());
     params.width                     = get_resolved_width();
@@ -2635,6 +2749,9 @@ std::string SDGenerationParams::to_string() const {
         << "  mask_image_path: \"" << mask_image_path << "\",\n"
         << "  control_image_path: \"" << control_image_path << "\",\n"
         << "  ref_image_paths: " << vec_str_to_string(ref_image_paths) << ",\n"
+        << "  ref_video_paths: " << vec_str_to_string(ref_video_paths) << ",\n"
+        << "  ref_video_audio_paths: " << vec_str_to_string(ref_video_audio_paths) << ",\n"
+        << "  ref_audio_paths: " << vec_str_to_string(ref_audio_paths) << ",\n"
         << "  control_video_path: \"" << control_video_path << "\",\n"
         << "  auto_resize_ref_image: " << (auto_resize_ref_image ? "true" : "false") << ",\n"
         << "  increase_ref_index: " << (increase_ref_index ? "true" : "false") << ",\n"
@@ -2790,6 +2907,7 @@ std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
     root["clip_skip"]             = gen_params.clip_skip;
     root["strength"]              = gen_params.strength;
     root["control_strength"]      = gen_params.control_strength;
+    root["ip_adapter_strength"]   = gen_params.ip_adapter_strength;
     root["auto_resize_ref_image"] = gen_params.auto_resize_ref_image;
     root["increase_ref_index"]    = gen_params.increase_ref_index;
     if (mode == VID_GEN) {

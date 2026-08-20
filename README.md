@@ -15,6 +15,7 @@ API and command-line option may change frequently.***
 
 ## 🔥Important News
 
+* **2026/08/04** 🚀 stable-diffusion.cpp adds **Day-1 support for MiniMax-H3**
 * **2026/06/25** 🚀 stable-diffusion.cpp now supports **Krea2**
 * **2026/06/04** 🚀 stable-diffusion.cpp now supports **Ideogram4**
 * **2026/05/31** 🚀 stable-diffusion.cpp now supports **PiD**
@@ -66,10 +67,12 @@ API and command-line option may change frequently.***
     - [Mage-Flow-Edit](./docs/mage_flow.md#image-editing)
   - Video Models
     - [Wan2.1/Wan2.2](./docs/wan.md)
+    - [MiniMax-H3](./docs/minimax_h3.md)
     - [LTX-2.3](./docs/ltx2.md)
     - [HunyuanVideo 1.5](./docs/hunyuan_video.md)
     - [LingBot-Video](./docs/lingbot_video.md)
   - [PhotoMaker](./docs/photo_maker.md) support.
+  - [IP-Adapter](./docs/ip_adapter.md) support (SD 1.5 and SDXL, including Plus)
   - Control Net support with SD 1.5
   - [ADetailer](./docs/adetailer.md)
   - LoRA support, same as [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Features#lora)
@@ -149,6 +152,7 @@ For runtime and parameter backend placement, see the [backend selection guide](.
 - [LCM/LCM-LoRA](./docs/lcm.md)
 - [Docker](./docs/docker.md)
 - [Quantization and GGUF](./docs/quantization_and_gguf.md)
+- [INT8 convrot safetensors](./docs/int8_convrot.md)
 - [Inference acceleration via caching](./docs/caching.md)
 
 ## Bindings
@@ -167,6 +171,7 @@ These projects wrap `stable-diffusion.cpp` for easier use in other languages/fra
 
 These projects use `stable-diffusion.cpp` as a backend for their image generation.
 
+- [GIMP Plugins](https://github.com/themanyone/gimp-plugins)
 - [Jellybox](https://jellybox.com)
 - [Stable Diffusion GUI](https://github.com/fszontagh/sd.cpp.gui.wx)
 - [Stable Diffusion CLI-GUI](https://github.com/piallai/stable-diffusion.cpp)

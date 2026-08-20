@@ -307,8 +307,33 @@ struct KarrasScheduler : SigmaScheduler {
 };
 
 struct BetaScheduler : SigmaScheduler {
-    static constexpr double alpha = 0.6;
-    static constexpr double beta  = 0.6;
+    double alpha = 0.6;
+    double beta  = 0.6;
+
+    explicit BetaScheduler(const char* extra_sample_args = nullptr) {
+        parse_extra_sample_args(extra_sample_args);
+        LOG_DEBUG("Beta scheduler: alpha=%.4f, beta=%.4f", alpha, beta);
+    }
+
+    void parse_extra_sample_args(const char* extra_sample_args) {
+        for (const auto& [key, value] : parse_key_value_args(extra_sample_args, "beta scheduler arg")) {
+            if (key == "alpha") {
+                float parsed;
+                if (!parse_strict_float(value, parsed) || parsed <= 0.0) {
+                    LOG_WARN("ignoring invalid beta scheduler arg '%s=%s'", key.c_str(), value.c_str());
+                } else {
+                    alpha = static_cast<double>(parsed);
+                }
+            } else if (key == "beta") {
+                float parsed;
+                if (!parse_strict_float(value, parsed) || parsed <= 0.0) {
+                    LOG_WARN("ignoring invalid beta scheduler arg '%s=%s'", key.c_str(), value.c_str());
+                } else {
+                    beta = static_cast<double>(parsed);
+                }
+            }
+        }
+    }
 
     static double log_beta(double a, double b) {
         return std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
@@ -1033,7 +1058,7 @@ struct Denoiser {
                 break;
             case BETA_SCHEDULER:
                 LOG_INFO("get_sigmas with Beta scheduler");
-                scheduler = std::make_shared<BetaScheduler>();
+                scheduler = std::make_shared<BetaScheduler>(extra_sample_args);
                 break;
             case EXPONENTIAL_SCHEDULER:
                 LOG_INFO("get_sigmas exponential scheduler");
@@ -2554,6 +2579,112 @@ static sd::Tensor<float> sample_tcd(denoise_cb_t model,
     return x;
 }
 
+static sd::Tensor<float> sample_lms(denoise_cb_t model,
+                                    sd::Tensor<float> x,
+                                    const std::vector<float>& sigmas,
+                                    const SamplerExtraArgs& extra_sample_args) {
+    // Linear Multi-Step from https://github.com/crowsonkb/k-diffusion,
+    // modified with "history shift" value, which seemingly needs less steps
+    int divisions = 1000;
+    int max_order = 4;
+    int shift     = 1;  // 4, 0 - original; 4, 1 - PR #1843; 3, 1 - smoother image
+    for (const auto& [key, value] : extra_sample_args) {
+        int parsed = 0;
+        if (key == "lms_max_order") {
+            if (!parse_strict_int(value, parsed)) {
+                LOG_WARN("ignoring invalid lms extra sample arg '%s=%s'", key.c_str(), value.c_str());
+                continue;
+            }
+            max_order = std::max(1, parsed);
+            // smaller values make the result softer, closer to Euler
+            // higher values need more steps
+            // values above 12 can produce NaNs, depending on steps and scheduler
+        }
+        if (key == "lms_shift") {
+            if (!parse_strict_int(value, parsed)) {
+                LOG_WARN("ignoring invalid lms extra sample arg '%s=%s'", key.c_str(), value.c_str());
+                continue;
+            }
+            shift = std::max(0, parsed);
+            // for a low number of steps, the value 1 works best
+        }
+        if (key == "lms_divisions") {
+            if (!parse_strict_int(value, parsed)) {
+                LOG_WARN("ignoring invalid lms extra sample arg '%s=%s'", key.c_str(), value.c_str());
+                continue;
+            }
+            divisions = parsed;  // std::max(1, parsed);
+            // values < 1 always produce noise
+            // values above 30M require double precision in the integrator
+            // (they are needless and just slow the integration down, but
+            //  with single precision they softly produce noise
+            //  near the 35M, it can be used for distorted generations)
+        }
+    }
+
+    auto linear_multistep_coeff = [=](const int order, const int m, const int j) -> float {
+        if (!divisions)
+            return sigmas[m + 1] - sigmas[m];  // delta / 0 * 0
+#define LMS_PRECISION float                    // when divisions > 30 millions, the double precision fixes noise
+        const LMS_PRECISION a = sigmas[m], dx = (sigmas[m + 1] - a) / divisions, s = sigmas[m - j];
+        const LMS_PRECISION b0 = a + 0.5f * dx;  // using Riemann middle integral
+        LMS_PRECISION sum      = 0.0f;
+        for (int h = 0; h < divisions; h++) {
+            const LMS_PRECISION b = h * dx + b0;
+            LMS_PRECISION prod    = 1.0f;
+            for (int k = 0; k < j; k++) {
+                const LMS_PRECISION t = sigmas[m - k];
+                prod *= (b - t) / (s - t);
+            }
+            for (int k = j + 1; k < order; k++) {
+                const LMS_PRECISION t = sigmas[m - k];
+                prod *= (b - t) / (s - t);
+            }
+            sum += prod;
+        }
+        return sum * dx;
+    };
+
+    int steps = static_cast<int>(sigmas.size()) - 1;
+    max_order = std::min(max_order, steps);  // history can not be larger than steps
+    LOG_DEBUG("linear multi-step sampler: lms_max_order = %i, lms_shift = %i, lms_divisions = %i", max_order, shift, divisions);
+    std::vector<float> lms_coeff(max_order);
+    std::vector<sd::Tensor<float>> hist = {};
+
+    for (int i = 0; i < steps; i++) {
+        const float sigma = sigmas[i];
+
+        auto denoised_opt = model(x, sigma, i + 1);
+        if (denoised_opt.pred.empty()) {
+            return {};
+        }
+        sd::Tensor<float> denoised = std::move(denoised_opt.pred);
+
+        const int order = std::min(max_order, i + 1);
+
+        for (int c = 0; c < order; c++)  // computing coefficients
+            lms_coeff[c] = linear_multistep_coeff(order, i, c);
+
+        sd::Tensor<float> d_cur = (x - denoised) / sigma;
+        x += d_cur * lms_coeff[0];
+        if (max_order > 1) {  // if max_order == 1, the history is not used (order always < 2)
+            int hist_size_p1 = hist.size() + 1;
+            if (i) {  // history does not exist at 1st step
+                int hist_max = hist.size() - 1;
+                for (int c = 2; c <= order; c++)
+                    x += hist[std::min(hist_max, hist_size_p1 - c + shift)] * lms_coeff[c - 1];
+                // max_order == 4  =>  hist[] index = 2, 1, 0
+                // shift == 1      =>  hist[] index = 2, 2, 1
+            }
+            if (hist_size_p1 == max_order) {
+                hist.erase(hist.begin());
+            }
+            hist.push_back(std::move(d_cur));
+        }
+    }
+    return x;
+}
+
 static sd::Tensor<float> sample_euler_cfg_pp(denoise_cb_t model,
                                              sd::Tensor<float> x,
                                              const std::vector<float>& sigmas) {
@@ -2716,6 +2847,8 @@ static sd::Tensor<float> sample_k_diffusion(sample_method_t method,
             return sample_euler_ancestral(model, std::move(x), sigmas, rng, is_flow_denoiser, eta);
         case TCD_SAMPLE_METHOD:
             return sample_tcd(model, std::move(x), sigmas, rng, eta);
+        case LMS_SAMPLE_METHOD:
+            return sample_lms(model, std::move(x), sigmas, extra_args);
         case EULER_CFG_PP_SAMPLE_METHOD:
             return sample_euler_cfg_pp(model, std::move(x), sigmas);
         case EULER_A_CFG_PP_SAMPLE_METHOD:
