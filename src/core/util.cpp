@@ -801,7 +801,11 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     float round_bracket_multiplier  = 1.1f;
     float square_bracket_multiplier = 1 / 1.1f;
 
-    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]+)\)|\)|\]|\bBREAK\b|[^\\()\[\]:B]+|:|\bB)");
+    // The plain-text run is length-bounded because libstdc++ std::regex
+    // recurses per matched character; an unbounded run overflows the stack
+    // on multi-kilobyte prompts. Adjacent equal-weight segments are merged
+    // below, so splitting a long run does not change the result.
+    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]+)\)|\)|\]|\bBREAK\b|[^\\()\[\]:B]{1,1024}|:|\bB)");
     std::regex re_break(R"(\s*\bBREAK\b\s*)");
 
     auto multiply_range = [&](int start_position, float multiplier) {
