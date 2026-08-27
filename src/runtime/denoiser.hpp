@@ -1204,6 +1204,153 @@ struct CompVisVDenoiser : public CompVisDenoiser {
     }
 };
 
+/*========================= AnimateAnyone: zero-SNR v-prediction trailing DDIM =========================*/
+//
+// AnimateAnyone's v2 scheduler config (diffusers `DDIMScheduler`, see
+// docs/superpowers/notes/animate-anyone-pytorch-map.md section 5): beta_start=0.00085,
+// beta_end=0.012, beta_schedule="linear" (note: NOT the scaled_linear sqrt-linspace that
+// calculate_alphas_cumprod() in stable-diffusion.cpp uses for every other SD1.x-family
+// model in this fork), clip_sample=false, steps_offset=1, prediction_type="v_prediction",
+// rescale_betas_zero_snr=True, timestep_spacing="trailing".
+//
+// Zero-SNR rescale forces the LAST alphas_cumprod entry to exactly 0.0. That makes the
+// k-diffusion CompVis sigma transform sigma = sqrt((1-a)/a) (CompVisDenoiser/CompVisVDenoiser
+// above, and everything dispatched through sample_k_diffusion(), which all operate in sigma
+// space) produce +inf for that entry -- unrepresentable. Per the task brief's two options
+// ((a) a dedicated alphas-space DDIM step for this family, bypassing the sigma transform for
+// the terminal entry, vs (b) clamping the terminal alpha to a small epsilon), this fork takes
+// option (a): the functions below consume alphas_cumprod directly and never round-trip through
+// sigma, so the terminal entry is exact rather than an approximation whose error would have to
+// be bounded and justified. Nothing here is wired into CompVisDenoiser/CompVisVDenoiser, the
+// generic scheduler dispatch in Denoiser::get_sigmas(), or sample_k_diffusion() -- those, and
+// every other model family's sigma/timestep math, are unchanged. Callers must gate use of this
+// namespace on sd_version_is_animate_anyone(version).
+namespace animate_anyone_scheduler {
+
+// diffusers DDIMScheduler(beta_schedule="linear"): betas = linspace(beta_start, beta_end, timesteps),
+// i.e. plain linear betas -- distinct from calculate_alphas_cumprod()'s scaled_linear schedule.
+// Kept in double throughout this namespace (see rescale_zero_terminal_snr_betas below for why):
+// only the final calculate_alphas_cumprod() output is narrowed to float.
+inline void calculate_linear_betas(double* betas, double beta_start, double beta_end, int timesteps) {
+    for (int i = 0; i < timesteps; i++) {
+        double w = (timesteps > 1) ? (double)i / (double)(timesteps - 1) : 0.0;
+        betas[i] = beta_start + (beta_end - beta_start) * w;
+    }
+}
+
+// Ported verbatim from diffusers.schedulers.scheduling_ddim.rescale_zero_terminal_snr()
+// (diffusers 0.24.0, site-packages/diffusers/schedulers/scheduling_ddim.py:95-128; Algorithm 1
+// of https://arxiv.org/pdf/2305.08891.pdf). Rewrites `betas` in place.
+//
+// Kept entirely in double precision (not float, despite every other value in this fork's
+// scheduler code being float): near the terminal end of the AnimateAnyone v2 schedule the
+// rescaled betas are extremely close to 1 (alphas_cumprod there is ~1e-7..0), so betas[i] and
+// 1-betas[i] differ by far more bits than a float32 mantissa carries. Round-tripping through
+// float here (as an earlier version of this function did) cost ~2e-5 relative error in the
+// final alphas_cumprod at that tail -- above the fixture's 1e-6 tolerance. torch's own
+// rescale_zero_terminal_snr operates on float32 tensors too, but PyTorch's fused sqrt/cumprod
+// ops keep more working precision than a naive scalar C++ loop would at float32; using double
+// here reproduces the reference values without needing to reverse-engineer torch's exact
+// intermediate rounding.
+inline void rescale_zero_terminal_snr_betas(double* betas, int timesteps) {
+    std::vector<double> alphas_bar_sqrt(timesteps);
+    double product = 1.0;
+    for (int i = 0; i < timesteps; i++) {
+        product *= (1.0 - betas[i]);
+        alphas_bar_sqrt[i] = std::sqrt(product);
+    }
+
+    double sqrt_0 = alphas_bar_sqrt[0];
+    double sqrt_T = alphas_bar_sqrt[timesteps - 1];
+    for (int i = 0; i < timesteps; i++) {
+        alphas_bar_sqrt[i] -= sqrt_T;
+        alphas_bar_sqrt[i] *= sqrt_0 / (sqrt_0 - sqrt_T);
+    }
+
+    std::vector<double> alphas_bar(timesteps);
+    for (int i = 0; i < timesteps; i++) {
+        alphas_bar[i] = alphas_bar_sqrt[i] * alphas_bar_sqrt[i];
+    }
+
+    betas[0] = 1.0 - alphas_bar[0];
+    for (int i = 1; i < timesteps; i++) {
+        double alpha_i = alphas_bar[i] / alphas_bar[i - 1];
+        betas[i]        = 1.0 - alpha_i;
+    }
+}
+
+// Full chain: linear betas -> zero-SNR rescale -> alphas_cumprod, all in double precision until
+// the final narrowing to float (see rescale_zero_terminal_snr_betas for why). Defaults match
+// `configs/inference/inference_v2.yaml`.
+inline void calculate_alphas_cumprod(float* alphas_cumprod,
+                                     float beta_start = 0.00085f,
+                                     float beta_end   = 0.012f,
+                                     int timesteps    = TIMESTEPS) {
+    std::vector<double> betas(timesteps);
+    calculate_linear_betas(betas.data(), (double)beta_start, (double)beta_end, timesteps);
+    rescale_zero_terminal_snr_betas(betas.data(), timesteps);
+
+    double product = 1.0;
+    for (int i = 0; i < timesteps; i++) {
+        product *= (1.0 - betas[i]);
+        alphas_cumprod[i] = (float)product;
+    }
+    // Guaranteed exactly 0.0 by construction (alphas_bar_sqrt[T] - sqrt_T cancels exactly in
+    // IEEE754 before any scaling), but pinned explicitly: this is the zero-terminal-SNR
+    // invariant the whole rescale exists to produce, not an incidental floating point value.
+    alphas_cumprod[timesteps - 1] = 0.0f;
+}
+
+// diffusers DDIMScheduler.set_timesteps(), timestep_spacing="trailing" branch
+// (scheduling_ddim.py:331-336). Note steps_offset is only applied on the "leading" branch in
+// diffusers -- the "-1" here is what gives trailing spacing its steps_offset=1-like behavior.
+// num_train_timesteps/num_inference_steps = 1000/25 = 40.0 exactly, so np.round() has no
+// half-to-even ambiguity to reproduce.
+inline std::vector<int> trailing_timesteps(int num_train_timesteps, int num_inference_steps) {
+    std::vector<int> result;
+    result.reserve(num_inference_steps);
+    double step_ratio = (double)num_train_timesteps / (double)num_inference_steps;
+    for (int i = 0; i < num_inference_steps; i++) {
+        double v = (double)num_train_timesteps - (double)i * step_ratio;
+        int t    = (int)std::lround(v);
+        result.push_back(t - 1);
+    }
+    return result;
+}
+
+// diffusers DDIMScheduler.step(), prediction_type="v_prediction", eta=0.0 (std_dev_t=0),
+// clip_sample=False (no thresholding of pred_original_sample), set_alpha_to_one=True (diffusers
+// default -- callers pass alpha_prod_t_prev=1.0 for the terminal step, where there is no
+// previous timestep). Ported verbatim from scheduling_ddim.py:step():344-450.
+inline sd::Tensor<float> ddim_v_pred_step(const sd::Tensor<float>& x_t,
+                                          const sd::Tensor<float>& v,
+                                          float alpha_prod_t,
+                                          float alpha_prod_t_prev) {
+    float beta_prod_t                  = 1.0f - alpha_prod_t;
+    float sqrt_alpha_prod_t            = std::sqrt(alpha_prod_t);
+    float sqrt_beta_prod_t             = std::sqrt(beta_prod_t);
+    float sqrt_alpha_prod_t_prev       = std::sqrt(alpha_prod_t_prev);
+    // std_dev_t = eta * sqrt(variance) = 0, so pred_sample_direction's coefficient is just
+    // sqrt(1 - alpha_prod_t_prev - std_dev_t^2) = sqrt(1 - alpha_prod_t_prev).
+    float sqrt_one_minus_alpha_prod_t_prev = std::sqrt(std::max(0.0f, 1.0f - alpha_prod_t_prev));
+
+    sd::Tensor<float> prev_sample(x_t.shape());
+    int64_t n = x_t.numel();
+    for (int64_t i = 0; i < n; i++) {
+        float xt = x_t[i];
+        float vv = v[i];
+        // v_prediction: pred_original_sample = sqrt(a_t)*x_t - sqrt(1-a_t)*v
+        //               pred_epsilon         = sqrt(a_t)*v   + sqrt(1-a_t)*x_t
+        float pred_original_sample     = sqrt_alpha_prod_t * xt - sqrt_beta_prod_t * vv;
+        float pred_epsilon             = sqrt_alpha_prod_t * vv + sqrt_beta_prod_t * xt;
+        float pred_sample_direction    = sqrt_one_minus_alpha_prod_t_prev * pred_epsilon;
+        prev_sample[i]                 = sqrt_alpha_prod_t_prev * pred_original_sample + pred_sample_direction;
+    }
+    return prev_sample;
+}
+
+}  // namespace animate_anyone_scheduler
+
 struct EDMVDenoiser : public CompVisVDenoiser {
     float min_sigma = 0.002f;
     float max_sigma = 120.0f;

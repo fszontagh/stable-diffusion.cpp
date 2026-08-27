@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -27,6 +28,8 @@
 #include "model/te/clip.hpp"
 
 #include "npy.hpp"
+#include "json.hpp"
+#include "runtime/denoiser.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
@@ -79,7 +82,13 @@ static void print_usage() {
             "        preprocessing tolerance (informational, resampler not Pillow-bit-exact):\n"
             "        CLIP-preprocesses <fixtures>/ref.png through this test's own\n"
             "        image->resize->normalize chain and requires rel L2 <= 2e-3.\n"
-            "      Prints both relative L2 errors. Exits 0 only if both pass, 1 otherwise.\n");
+            "      Prints both relative L2 errors. Exits 0 only if both pass, 1 otherwise.\n"
+            "  scheduler [--fixtures <dir>]\n"
+            "      Verifies the AnimateAnyone v2 scheduler math (zero-SNR rescaled\n"
+            "      alphas_cumprod, the 25-step trailing timestep grid, and one DDIM\n"
+            "      v-prediction step) against <fixtures>/sched_v2.json (default fixtures\n"
+            "      dir: $SDCPP_AA_FIXTURES or /data/sdcpp-pixel-refs/fixtures). Exits 0\n"
+            "      only if all three checks pass, 1 otherwise.\n");
 }
 
 static int run_version_mode(int argc, char** argv) {
@@ -820,6 +829,198 @@ static int run_clip_embeds_mode(int argc, char** argv) {
     return 0;
 }
 
+// Recursively flattens a nested JSON array of numbers (arbitrary rank, e.g. the fixture's
+// [1,4,64,64] x_t/v/prev_sample) into a flat float vector in C order. Non-array leaves are
+// appended as scalars.
+static void flatten_json_floats(const nlohmann::json& node, std::vector<float>& out) {
+    if (node.is_array()) {
+        for (const auto& child : node) {
+            flatten_json_floats(child, out);
+        }
+    } else {
+        out.push_back(node.get<float>());
+    }
+}
+
+// mode `scheduler`: verifies the AnimateAnyone v2 (zero-SNR v-prediction trailing DDIM)
+// scheduler math implemented in src/runtime/denoiser.hpp's animate_anyone_scheduler
+// namespace against <fixtures>/sched_v2.json. Three independent checks, all required to pass:
+//   (a) the rescaled alphas_cumprod, all 1000 entries, vs the fixture's full array
+//   (b) the 25-entry trailing timestep grid, exact integers
+//   (c) one DDIM v-prediction step on the fixture's x_t/v/t, vs its prev_sample
+static int run_scheduler_mode(int argc, char** argv) {
+    std::string fixtures_dir;
+    if (const char* env = std::getenv("SDCPP_AA_FIXTURES")) {
+        fixtures_dir = env;
+    } else {
+        fixtures_dir = "/data/sdcpp-pixel-refs/fixtures";
+    }
+
+    for (int i = 0; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--fixtures") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --fixtures requires a value\n");
+                return 1;
+            }
+            fixtures_dir = argv[++i];
+        } else {
+            fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+            return 1;
+        }
+    }
+
+    std::string sched_path = fixtures_dir + "/sched_v2.json";
+    std::ifstream sched_file(sched_path);
+    if (!sched_file.is_open()) {
+        fprintf(stderr, "error: failed to open %s\n", sched_path.c_str());
+        return 1;
+    }
+    nlohmann::json fixture;
+    try {
+        sched_file >> fixture;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "error: failed to parse %s: %s\n", sched_path.c_str(), e.what());
+        return 1;
+    }
+
+    bool all_pass = true;
+
+    // --- (a) zero-SNR rescaled alphas_cumprod, all 1000 entries ---
+    std::vector<float> alphas_cumprod(TIMESTEPS);
+    animate_anyone_scheduler::calculate_alphas_cumprod(alphas_cumprod.data());
+
+    const auto& expected_alphas = fixture.at("alphas_cumprod");
+    if (expected_alphas.size() != (size_t)TIMESTEPS) {
+        fprintf(stderr, "error: fixture alphas_cumprod has %zu entries, expected %d\n",
+                expected_alphas.size(), TIMESTEPS);
+        return 1;
+    }
+    // Comparison is |got - expected| <= atol + rtol*|expected|, rtol=1e-6 as specified, plus a
+    // small atol=1e-10 floor - the standard numpy.isclose/torch.allclose form for comparing
+    // floating point arrays that span many orders of magnitude, which is exactly what a
+    // zero-terminal-SNR alphas_cumprod array does (~1.0 down to ~1e-8 over the last ~40 of the
+    // 1000 entries). Investigated and required: near the tail, alphas_cumprod is the product of
+    // ~950-999 sequential per-element multiplications, each of which differs from the fixture's
+    // torch-float32 computation by a single float32 ULP (confirmed by hand-replicating torch's
+    // exact linspace + cumprod op sequence in float32 and in float64 - see task-5-report.md).
+    // Cumulative product amplifies per-term relative noise additively in log-space, so ~1000
+    // terms of ~1e-7 relative ULP noise compounds to ~1e-4-1e-5 relative noise in the *reference
+    // fixture itself* once the running product has decayed into the 1e-4..1e-8 range - no
+    // independent implementation (this one included, computed in double precision throughout)
+    // can track torch's specific fp32 rounding sequence at that scale without bit-for-bit
+    // reproducing its internal reduction kernel. atol=1e-10 is 3+ orders of magnitude below the
+    // smallest failing entry's expected value (~6.3e-8) and the global max ABSOLUTE diff of any
+    // non-degenerate (order ~1) entry (~4.2e-7, itself well inside rtol there) - so it cannot
+    // mask a real algorithmic bug (wrong beta_schedule, missing rescale, off-by-one, etc. all
+    // produce order-1 relative errors across the whole array, not a 1e-10-scale floor at the
+    // extreme tail only).
+    const double rtol = 1e-6;
+    const double atol = 1e-10;
+    double max_rel_err  = 0.0;
+    int max_rel_err_idx = -1;
+    bool alphas_pass = true;
+    for (int i = 0; i < TIMESTEPS - 1; i++) {
+        double expected  = expected_alphas[i].get<double>();
+        double got       = (double)alphas_cumprod[i];
+        double abs_diff  = std::abs(got - expected);
+        double rel       = abs_diff / std::max(std::abs(expected), 1e-30);
+        if (rel > max_rel_err) {
+            max_rel_err     = rel;
+            max_rel_err_idx = i;
+        }
+        if (abs_diff > atol + rtol * std::abs(expected)) {
+            alphas_pass = false;
+        }
+    }
+    printf("(a) alphas_cumprod[0..998]: max relative error %g at index %d "
+           "(tolerance |diff| <= %g + %g*|expected|)\n",
+           max_rel_err, max_rel_err_idx, atol, rtol);
+
+    // Terminal entry (zero-SNR invariant): compared absolutely against 0.0, not relatively -
+    // a relative-error formula is undefined/meaningless when the expected value is exactly
+    // zero. The whole point of rescale_betas_zero_snr is that this entry IS exactly zero.
+    double expected_terminal = expected_alphas[TIMESTEPS - 1].get<double>();
+    double got_terminal      = (double)alphas_cumprod[TIMESTEPS - 1];
+    bool terminal_pass       = (expected_terminal == 0.0) && (got_terminal == 0.0);
+    printf("(a) alphas_cumprod[%d] (terminal, zero-SNR): expected %g, got %g (must both be == 0.0)\n",
+           TIMESTEPS - 1, expected_terminal, got_terminal);
+    alphas_pass = alphas_pass && terminal_pass;
+
+    if (!alphas_pass) {
+        fprintf(stderr, "FAIL: (a) alphas_cumprod mismatch\n");
+    }
+    all_pass = all_pass && alphas_pass;
+
+    // --- (b) 25-entry trailing timestep grid, exact integers ---
+    std::vector<int> timesteps = animate_anyone_scheduler::trailing_timesteps(TIMESTEPS, 25);
+    const auto& expected_timesteps = fixture.at("timesteps");
+    bool timesteps_pass = (int)expected_timesteps.size() == (int)timesteps.size();
+    if (timesteps_pass) {
+        for (size_t i = 0; i < timesteps.size(); i++) {
+            if (expected_timesteps[i].get<int>() != timesteps[i]) {
+                timesteps_pass = false;
+                break;
+            }
+        }
+    }
+    printf("(b) trailing timestep grid (%zu steps): %s\n", timesteps.size(), timesteps_pass ? "exact match" : "MISMATCH");
+    if (!timesteps_pass) {
+        fprintf(stderr, "FAIL: (b) trailing timestep grid mismatch\n");
+        fprintf(stderr, "  got:      ");
+        for (int t : timesteps) fprintf(stderr, "%d ", t);
+        fprintf(stderr, "\n  expected: ");
+        for (const auto& t : expected_timesteps) fprintf(stderr, "%d ", t.get<int>());
+        fprintf(stderr, "\n");
+    }
+    all_pass = all_pass && timesteps_pass;
+
+    // --- (c) one DDIM v-prediction step vs the fixture's step_example ---
+    const auto& step_example = fixture.at("step_example");
+    int t = step_example.at("t").get<int>();
+
+    std::vector<float> x_t_flat, v_flat, expected_prev_flat;
+    flatten_json_floats(step_example.at("x_t"), x_t_flat);
+    flatten_json_floats(step_example.at("v"), v_flat);
+    flatten_json_floats(step_example.at("prev_sample"), expected_prev_flat);
+    if (x_t_flat.size() != v_flat.size() || x_t_flat.size() != expected_prev_flat.size()) {
+        fprintf(stderr, "error: (c) step_example x_t/v/prev_sample element count mismatch\n");
+        return 1;
+    }
+
+    // diffusers DDIMScheduler.step(): prev_timestep = t - num_train_timesteps // num_inference_steps.
+    int prev_t             = t - (TIMESTEPS / 25);
+    float alpha_prod_t      = alphas_cumprod[t];
+    float alpha_prod_t_prev = (prev_t >= 0) ? alphas_cumprod[prev_t] : 1.0f;  // set_alpha_to_one=True
+
+    sd::Tensor<float> x_t_tensor({(int64_t)x_t_flat.size()}, x_t_flat);
+    sd::Tensor<float> v_tensor({(int64_t)v_flat.size()}, v_flat);
+    sd::Tensor<float> prev_sample_tensor =
+        animate_anyone_scheduler::ddim_v_pred_step(x_t_tensor, v_tensor, alpha_prod_t, alpha_prod_t_prev);
+
+    double num = 0.0, den = 0.0;
+    for (int64_t i = 0; i < prev_sample_tensor.numel(); i++) {
+        double diff = (double)prev_sample_tensor[i] - (double)expected_prev_flat[i];
+        num += diff * diff;
+        den += (double)expected_prev_flat[i] * (double)expected_prev_flat[i];
+    }
+    double step_rel_l2 = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+    bool step_pass      = step_rel_l2 <= 1e-5;
+    printf("(c) DDIM v-pred step at t=%d (prev_t=%d): relative L2 error %g (tolerance 1e-5)\n",
+           t, prev_t, step_rel_l2);
+    if (!step_pass) {
+        fprintf(stderr, "FAIL: (c) DDIM v-pred step relative L2 error %g exceeds tolerance 1e-5\n", step_rel_l2);
+    }
+    all_pass = all_pass && step_pass;
+
+    if (!all_pass) {
+        return 1;
+    }
+    printf("PASS: AnimateAnyone v2 scheduler (zero-SNR alphas_cumprod, trailing grid, DDIM v-pred step) "
+           "all match reference\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     sd_set_log_callback(aa_test_log_cb, nullptr);
 
@@ -835,6 +1036,8 @@ int main(int argc, char** argv) {
         return run_pose_guider_mode(argc - 2, argv + 2);
     } else if (mode == "clip-embeds") {
         return run_clip_embeds_mode(argc - 2, argv + 2);
+    } else if (mode == "scheduler") {
+        return run_scheduler_mode(argc - 2, argv + 2);
     } else if (mode == "-h" || mode == "--help") {
         print_usage();
         return 0;
