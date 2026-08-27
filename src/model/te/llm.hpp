@@ -73,6 +73,7 @@ namespace LLM {
         int num_heads                       = 16;
         int64_t in_channels                 = 3;
         int64_t out_hidden_size             = 3584;
+        bool out_hidden_size_detected       = false;
         int temporal_patch_size             = 2;
         int patch_size                      = 14;
         int spatial_merge_size              = 2;
@@ -238,7 +239,8 @@ namespace LLM {
                     }
                     if (contains(name, "visual.merger.linear_fc2.weight") ||
                         contains(name, "visual.merger.mlp.2.weight")) {
-                        config.vision.out_hidden_size = tensor_storage.ne[1];
+                        config.vision.out_hidden_size          = tensor_storage.ne[1];
+                        config.vision.out_hidden_size_detected = true;
                     }
                     continue;
                 }
@@ -1766,6 +1768,16 @@ namespace LLM {
               enable_vision(enable_vision_) {
             if (enable_vision && !config.have_vision_weight) {
                 LOG_WARN("no vision weights detected, vision disabled");
+                enable_vision = false;
+            }
+            // Only trust the comparison when the projector output dim came from the
+            // weights; the default would otherwise reject valid models.
+            if (enable_vision && config.vision.out_hidden_size_detected &&
+                config.vision.out_hidden_size != config.hidden_size) {
+                LOG_ERROR("vision projector output size (%" PRId64 ") does not match LLM hidden size (%" PRId64 "), "
+                          "the vision weights (mmproj) likely belong to a different LLM variant, vision disabled",
+                          config.vision.out_hidden_size,
+                          config.hidden_size);
                 enable_vision = false;
             }
             if (enable_vision) {
