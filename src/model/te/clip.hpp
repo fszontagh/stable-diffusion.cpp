@@ -14,11 +14,22 @@ protected:
     bool use_gelu;
 
 public:
-    CLIPMLP(int64_t d_model, int64_t intermediate_size) {
+    // force_quick_gelu overrides the d_model-based heuristic below. The heuristic
+    // conflates two different embedding spaces (SD1.x/SD2.x text encoders vs.
+    // OpenAI/OpenCLIP vision encoders) and gets it wrong for the OpenAI ViT-L/14
+    // vision encoder used by sd-image-variations (AnimateAnyone's CLIP image
+    // conditioner): hidden_size 1024 hits the "d_model == 1024" branch below and
+    // picks plain gelu, but OpenAI CLIP vision towers (all of them, including
+    // ViT-L/14) are quick_gelu per their HF config ("hidden_act": "quick_gelu").
+    // Defaults to false so every existing caller (SD1.x/SD2.x text, ViT-H vision,
+    // PhotoMaker's ViT-L vision) keeps its exact prior behavior.
+    CLIPMLP(int64_t d_model, int64_t intermediate_size, bool force_quick_gelu = false) {
         blocks["fc1"] = std::shared_ptr<GGMLBlock>(new Linear(d_model, intermediate_size));
         blocks["fc2"] = std::shared_ptr<GGMLBlock>(new Linear(intermediate_size, d_model));
 
-        if (d_model == 1024 || d_model == 1280) {  // SD 2.x
+        if (force_quick_gelu) {
+            use_gelu = false;
+        } else if (d_model == 1024 || d_model == 1280) {  // SD 2.x
             use_gelu = true;
         } else {  // SD 1.x
             use_gelu = false;
@@ -51,7 +62,8 @@ public:
     CLIPLayer(int64_t d_model,
               int64_t n_head,
               int64_t intermediate_size,
-              bool proj_in = false)
+              bool proj_in          = false,
+              bool force_quick_gelu = false)
         : d_model(d_model),
           n_head(n_head),
           intermediate_size(intermediate_size) {
@@ -60,7 +72,7 @@ public:
         blocks["layer_norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_model));
         blocks["layer_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_model));
 
-        blocks["mlp"] = std::shared_ptr<GGMLBlock>(new CLIPMLP(d_model, intermediate_size));
+        blocks["mlp"] = std::shared_ptr<GGMLBlock>(new CLIPMLP(d_model, intermediate_size, force_quick_gelu));
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* mask = nullptr) {
@@ -85,11 +97,12 @@ public:
                 int64_t d_model,
                 int64_t n_head,
                 int64_t intermediate_size,
-                bool proj_in = false)
+                bool proj_in          = false,
+                bool force_quick_gelu = false)
         : n_layer(n_layer) {
         for (int i = 0; i < n_layer; i++) {
             std::string name = "layers." + std::to_string(i);
-            blocks[name]     = std::shared_ptr<GGMLBlock>(new CLIPLayer(d_model, n_head, intermediate_size, proj_in));
+            blocks[name]     = std::shared_ptr<GGMLBlock>(new CLIPLayer(d_model, n_head, intermediate_size, proj_in, force_quick_gelu));
         }
     }
 
@@ -342,7 +355,10 @@ public:
     int32_t n_layer           = 24;
 
 public:
-    CLIPVisionModel(CLIPVersion version = OPENAI_CLIP_VIT_L_14, bool proj_in = false) {
+    // force_quick_gelu: see CLIPMLP. Needed for the OpenAI ViT-L/14 vision tower
+    // (sd-image-variations image encoder, AnimateAnyone) which is quick_gelu but
+    // shares hidden_size 1024 with the (plain-gelu) OpenCLIP ViT-H/14 vision tower.
+    CLIPVisionModel(CLIPVersion version = OPENAI_CLIP_VIT_L_14, bool proj_in = false, bool force_quick_gelu = false) {
         if (version == OPEN_CLIP_VIT_H_14) {
             hidden_size       = 1280;
             intermediate_size = 5120;
@@ -357,7 +373,7 @@ public:
 
         blocks["embeddings"]     = std::shared_ptr<GGMLBlock>(new CLIPVisionEmbeddings(hidden_size, num_channels, patch_size, image_size));
         blocks["pre_layernorm"]  = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size));
-        blocks["encoder"]        = std::shared_ptr<GGMLBlock>(new CLIPEncoder(n_layer, hidden_size, n_head, intermediate_size, proj_in));
+        blocks["encoder"]        = std::shared_ptr<GGMLBlock>(new CLIPEncoder(n_layer, hidden_size, n_head, intermediate_size, proj_in, force_quick_gelu));
         blocks["post_layernorm"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size));
     }
 
@@ -432,7 +448,8 @@ public:
 public:
     CLIPVisionModelProjection(CLIPVersion version   = OPENAI_CLIP_VIT_L_14,
                               bool transpose_proj_w = false,
-                              bool proj_in          = false) {
+                              bool proj_in          = false,
+                              bool force_quick_gelu = false) {
         if (version == OPEN_CLIP_VIT_H_14) {
             hidden_size    = 1280;
             projection_dim = 1024;
@@ -440,7 +457,7 @@ public:
             hidden_size = 1664;
         }
 
-        blocks["vision_model"]      = std::shared_ptr<GGMLBlock>(new CLIPVisionModel(version, proj_in));
+        blocks["vision_model"]      = std::shared_ptr<GGMLBlock>(new CLIPVisionModel(version, proj_in, force_quick_gelu));
         blocks["visual_projection"] = std::shared_ptr<GGMLBlock>(new CLIPProjection(hidden_size, projection_dim, transpose_proj_w));
     }
 

@@ -22,6 +22,7 @@
 #include "core/tensor.hpp"
 #include "core/util.h"
 #include "model/adapter/pose_guider.hpp"
+#include "model/te/clip.hpp"
 
 #include "npy.hpp"
 
@@ -38,6 +39,16 @@ static void aa_test_log_cb(enum sd_log_level_t level, const char* text, void* /*
     fputs(text, stderr);
 }
 
+// Root directory for downloaded reference weights. Honored by every mode that
+// has a default weights path (pose-guider, clip-embeds) so the fixtures/weights
+// location isn't hard-coded to one machine.
+static std::string aa_weights_root() {
+    if (const char* env = std::getenv("SDCPP_AA_WEIGHTS")) {
+        return env;
+    }
+    return "/data/sdcpp-pixel-refs/weights";
+}
+
 static void print_usage() {
     fprintf(stderr,
             "usage: sd-aa-test <mode> [args]\n"
@@ -48,12 +59,22 @@ static void print_usage() {
             "      reference_net_path promotion rule, and prints the resulting version\n"
             "      display name. Exits 0 on success, 1 on failure.\n"
             "  pose-guider [--pose-guider <path>] [--fixtures <dir>]\n"
-            "      Loads pose_guider.pth (default: env SDCPP_AA_FIXTURES-independent path\n"
-            "      /data/sdcpp-pixel-refs/weights/AnimateAnyone/pose_guider.pth), runs the\n"
-            "      Moore PoseGuiderA forward pass on <fixtures>/pose.png (default fixtures\n"
-            "      dir: $SDCPP_AA_FIXTURES or /data/sdcpp-pixel-refs/fixtures), and compares\n"
-            "      against <fixtures>/pose_guider_a_out.npy. Prints the relative L2 error.\n"
-            "      Exits 0 on pass (rel L2 <= 1e-3), 1 on failure.\n");
+            "      Loads pose_guider.pth (default: $SDCPP_AA_WEIGHTS or\n"
+            "      /data/sdcpp-pixel-refs/weights, plus /AnimateAnyone/pose_guider.pth),\n"
+            "      runs the Moore PoseGuiderA forward pass on <fixtures>/pose.png (default\n"
+            "      fixtures dir: $SDCPP_AA_FIXTURES or /data/sdcpp-pixel-refs/fixtures), and\n"
+            "      compares against <fixtures>/pose_guider_a_out.npy. Prints the relative L2\n"
+            "      error. Exits 0 on pass (rel L2 <= 1e-3), 1 on failure.\n"
+            "  clip-embeds [--clip-vision <path>] [--fixtures <dir>]\n"
+            "      Loads the sd-image-variations CLIPVisionModelWithProjection encoder\n"
+            "      (default: $SDCPP_AA_WEIGHTS or /data/sdcpp-pixel-refs/weights, plus\n"
+            "      /image_encoder/pytorch_model.bin), CLIP-preprocesses <fixtures>/ref.png\n"
+            "      (default fixtures dir: $SDCPP_AA_FIXTURES or\n"
+            "      /data/sdcpp-pixel-refs/fixtures), runs the vision tower + visual\n"
+            "      projection, and compares the projected embedding against row 1 of\n"
+            "      <fixtures>/clip_embeds.npy (row 0 is asserted to be the all-zeros uncond\n"
+            "      embedding). Prints the relative L2 error. Exits 0 on pass (rel L2 <=\n"
+            "      1e-3), 1 on failure.\n");
 }
 
 static int run_version_mode(int argc, char** argv) {
@@ -152,7 +173,7 @@ struct PoseGuiderRunner : public GGMLRunner {
 };
 
 static int run_pose_guider_mode(int argc, char** argv) {
-    std::string weights_path = "/data/sdcpp-pixel-refs/weights/AnimateAnyone/pose_guider.pth";
+    std::string weights_path = aa_weights_root() + "/AnimateAnyone/pose_guider.pth";
     std::string fixtures_dir;
     if (const char* env = std::getenv("SDCPP_AA_FIXTURES")) {
         fixtures_dir = env;
@@ -337,6 +358,406 @@ static int run_pose_guider_mode(int argc, char** argv) {
     return 0;
 }
 
+// Standalone GGMLRunner wrapper around CLIPVisionModelProjection, modeled on
+// PoseGuiderRunner above. FrozenCLIPVisionEmbedder (conditioning/conditioner.hpp)
+// is hard-coded to OPEN_CLIP_VIT_H_14, so it can't load the sd-image-variations
+// encoder (OpenAI ViT-L/14 architecture, quick_gelu, 768-d projection) that
+// AnimateAnyone uses; this runner drives CLIPVisionModelProjection directly.
+struct ClipVisionRunner : public GGMLRunner {
+    CLIPVisionModelProjection model;
+
+    ClipVisionRunner(ggml_backend_t backend,
+                     const String2TensorStorage& tensor_storage_map,
+                     std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : GGMLRunner(backend, weight_manager),
+          model(build_model(tensor_storage_map)) {
+        model.init(params_ctx, tensor_storage_map, "");
+    }
+
+    // Fused-QKV (self_attn.in_proj_*) vs. separate q/k/v_proj is auto-detected from
+    // the checkpoint, matching FrozenCLIPVisionEmbedder's precedent
+    // (conditioning/conditioner.hpp:569-579). sd-image-variations' pytorch_model.bin
+    // uses separate q/k/v_proj (proj_in=false); the probe keeps this robust to other
+    // checkpoint layouts. force_quick_gelu=true: see CLIPMLP/CLIPVisionModel in
+    // model/te/clip.hpp - the sd-image-variations config specifies "hidden_act":
+    // "quick_gelu" explicitly, which the fork's d_model-based heuristic would
+    // otherwise miss (hidden_size 1024 collides with OpenCLIP ViT-H's gelu branch).
+    static CLIPVisionModelProjection build_model(const String2TensorStorage& tensor_storage_map) {
+        bool proj_in = false;
+        for (const auto& [name, tensor_storage] : tensor_storage_map) {
+            if (contains(name, "self_attn.in_proj")) {
+                proj_in = true;
+                break;
+            }
+        }
+        return CLIPVisionModelProjection(OPENAI_CLIP_VIT_L_14, /*transpose_proj_w=*/false, proj_in, /*force_quick_gelu=*/true);
+    }
+
+    std::string get_desc() override {
+        return "clip_vision_image_variations";
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
+        model.get_param_tensors(tensors);
+    }
+
+    ggml_cgraph* build_graph(const sd::Tensor<float>& pixel_values_tensor) {
+        ggml_cgraph* gf           = ggml_new_graph(compute_ctx);
+        ggml_tensor* pixel_values = make_input(pixel_values_tensor);
+        auto runner_ctx           = get_context();
+        // return_pooled=true, clip_skip=-1 (full 24 layers): projected image_embeds,
+        // matching CLIPVisionModelWithProjection(...).image_embeds in the reference
+        // pipeline (P-map section 8).
+        ggml_tensor* image_embeds = model.forward(&runner_ctx, pixel_values, true, -1);
+        ggml_build_forward_expand(gf, image_embeds);
+        return gf;
+    }
+
+    sd::Tensor<float> compute(int n_threads, const sd::Tensor<float>& pixel_values_tensor) {
+        auto get_graph = [&]() -> ggml_cgraph* { return build_graph(pixel_values_tensor); };
+        return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, true, true, true));
+    }
+};
+
+// PIL-matching bicubic resample weight. Pillow's BICUBIC filter (Pillow/src/libImaging/Resample.c,
+// `bicubic_filter`) uses the a=-0.5 Catmull-Rom-family cubic convolution kernel, NOT the a=-0.75
+// coefficient PyTorch (and this fork's core/tensor.hpp cubic_interpolate_weight, whose comment says
+// "Match PyTorch bicubic interpolation") uses. The two only differ in that one constant, but on a
+// 512->224 (2.3x) downsample the difference is large enough (measured: pixel-level rel L2 ~0.28%,
+// which the CLIP vision tower's 24 transformer layers amplify to ~9.7% on the pooled/projected
+// embedding) to blow the fixture's 1e-3 tolerance. This local helper reimplements the fork's own
+// antialias-aware separable-convolution resize (tensor.hpp's make_interpolate_contributors /
+// interpolate_2d_filter) with a=-0.5 instead, to match what the reference pipeline's PIL resize
+// actually computes. Kept local to aa_test rather than changing core/tensor.hpp's InterpolateMode::
+// Bicubic (which IP-Adapter/PhotoMaker/SVD/etc. depend on for its current, deliberately
+// PyTorch-matching, behavior).
+static double aa_pil_bicubic_weight(double x) {
+    constexpr double a = -0.5;
+    x                  = std::fabs(x);
+    if (x <= 1.0) {
+        return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    }
+    if (x < 2.0) {
+        return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a;
+    }
+    return 0.0;
+}
+
+struct AaResizeContributor {
+    int64_t index;
+    double weight;
+};
+
+// Antialias-widened (per tensor.hpp's antialias=true convention: filter support scales with the
+// downsample ratio) contributor list per output index, for one axis.
+static std::vector<std::vector<AaResizeContributor>> aa_make_resize_contributors(int64_t in_size, int64_t out_size) {
+    std::vector<std::vector<AaResizeContributor>> contributors(static_cast<size_t>(out_size));
+    const double scale        = static_cast<double>(in_size) / static_cast<double>(out_size);
+    const double filter_scale = std::max(1.0, scale);
+    const double support       = 2.0 * filter_scale;
+
+    for (int64_t out = 0; out < out_size; ++out) {
+        const double center = (static_cast<double>(out) + 0.5) * scale - 0.5;
+        int64_t start        = static_cast<int64_t>(std::ceil(center - support));
+        int64_t end           = static_cast<int64_t>(std::floor(center + support));
+        double weight_sum     = 0.0;
+        auto& axis_contribs   = contributors[static_cast<size_t>(out)];
+        for (int64_t in = start; in <= end; ++in) {
+            double weight = aa_pil_bicubic_weight((center - static_cast<double>(in)) / filter_scale);
+            if (weight == 0.0) {
+                continue;
+            }
+            int64_t clamped = std::min(std::max<int64_t>(in, 0), in_size - 1);
+            axis_contribs.push_back({clamped, weight});
+            weight_sum += weight;
+        }
+        if (std::fabs(weight_sum) > 1e-12) {
+            for (auto& c : axis_contribs) {
+                c.weight /= weight_sum;
+            }
+        }
+    }
+    return contributors;
+}
+
+// Separable two-pass resize of `image` ([W,H,C,1], values in [0,255]) to `size`x`size`,
+// matching PIL's bicubic (a=-0.5) antialiased downsampling.
+//
+// Pillow's C resample implementation (libImaging/Resample.c) does the horizontal and
+// vertical passes as two *separate* 8-bit images: the horizontal pass's output is
+// rounded/clipped to a uint8 image before the vertical pass runs on it, and the
+// vertical pass's output is likewise rounded/clipped to uint8 at the end. A first
+// version of this helper worked entirely in un-quantized float (resizing the [0,1]-
+// scaled tensor directly, one pass feeding the other with no rounding) and, despite
+// using the correct a=-0.5 kernel, still landed at ~0.5% relative L2 on the projected
+// CLIP embedding (5x over the 1e-3 fixture tolerance) - skipping the two intermediate
+// uint8 roundings turned out to matter enough to fail the check. Reproducing that
+// quantization (round-half-away-from-zero + clip to [0,255] after EACH pass, operating
+// on [0,255]-scale pixel values, not pre-divided-by-255 float) brought the measured
+// pixel-level rel L2 down another ~10x and the projected-embedding rel L2 comfortably
+// under tolerance. Kept local to aa_test (not core/tensor.hpp's InterpolateMode::
+// Bicubic) for the same reason as aa_pil_bicubic_weight above.
+static float aa_round_clip_u8(double v) {
+    // Round-half-to-even (std::nearbyint under the default FE_TONEAREST rounding
+    // mode), not round-half-up: empirically matches Pillow's actual output one tie
+    // case closer on this fixture (4 differing pixels out of 150528 vs 7, all off by
+    // exactly 1/255) than floor(v+0.5) round-half-up.
+    double rounded = std::nearbyint(v);
+    return static_cast<float>(std::min(std::max(rounded, 0.0), 255.0));
+}
+
+static sd::Tensor<float> aa_pil_bicubic_resize(const sd::Tensor<float>& image_0_255, int size) {
+    int64_t W = image_0_255.shape()[0], H = image_0_255.shape()[1], C = image_0_255.shape()[2];
+    auto row_contribs = aa_make_resize_contributors(W, size);  // horizontal axis
+    auto col_contribs = aa_make_resize_contributors(H, size);  // vertical axis
+
+    // Horizontal pass, then round/clip to uint8-equivalent (matches Pillow's
+    // intermediate 8-bit image between the two passes).
+    sd::Tensor<float> tmp({size, H, C, 1});
+    for (int64_t y = 0; y < H; ++y) {
+        for (int64_t c = 0; c < C; ++c) {
+            for (int64_t ox = 0; ox < size; ++ox) {
+                double acc = 0.0;
+                for (const auto& con : row_contribs[static_cast<size_t>(ox)]) {
+                    acc += con.weight * image_0_255.index(con.index, y, c, 0);
+                }
+                tmp.index(ox, y, c, 0) = aa_round_clip_u8(acc);
+            }
+        }
+    }
+
+    // Vertical pass, then round/clip to uint8-equivalent (Pillow's final output image
+    // is itself uint8).
+    sd::Tensor<float> out({size, size, C, 1});
+    for (int64_t oy = 0; oy < size; ++oy) {
+        for (int64_t c = 0; c < C; ++c) {
+            for (int64_t ox = 0; ox < size; ++ox) {
+                double acc = 0.0;
+                for (const auto& con : col_contribs[static_cast<size_t>(oy)]) {
+                    acc += con.weight * tmp.index(ox, con.index, c, 0);
+                }
+                out.index(ox, oy, c, 0) = aa_round_clip_u8(acc);
+            }
+        }
+    }
+    return out;
+}
+
+// CLIP-preprocesses `image` ([W,H,3,1], values in [0,255]) to a `size`x`size` tile
+// with CLIP's mean/std normalization, for the AnimateAnyone CLIP-vision-only path.
+//
+// Deliberately does NOT reuse the fork's shared clip_preprocess() (core/util.cpp).
+// That helper resizes with InterpolateMode::Nearest (its interpolate() call omits
+// the mode argument, which defaults to Nearest - see core/tensor.hpp:1226) and does
+// an aspect-ratio-preserving resize + center-crop. The reference pipeline instead
+// does `ref_image.resize((224,224))` (a plain PIL resize, default resample bicubic
+// in modern Pillow, that squashes to the target size ignoring aspect ratio) and then
+// feeds that into `CLIPImageProcessor()` defaults, whose own resize/crop become a
+// no-op once the image is already exactly target-sized. Nearest-neighbor 512->224
+// downsampling would not match a bicubic reference within the 1e-3 rel-L2 tolerance
+// at all, and even the fork's own antialiased Bicubic mode (PyTorch a=-0.75
+// convention, no intermediate 8-bit rounding) misses tolerance - see
+// aa_pil_bicubic_resize above for both fixes. The shared clip_preprocess() is left
+// untouched so IP-Adapter/PhotoMaker/SVD callers keep their exact prior behavior.
+static sd::Tensor<float> aa_clip_preprocess(const sd::Tensor<float>& image_0_255, int size) {
+    sd::Tensor<float> resized_0_255 = aa_pil_bicubic_resize(image_0_255, size);
+    sd::Tensor<float> scaled        = resized_0_255 / 255.0f;  // [0,255] -> [0,1]
+
+    // Same constants as core/util.cpp's clip_preprocess (CLIP's fixed mean/std).
+    sd::Tensor<float> mean({1, 1, 3, 1}, {0.48145466f, 0.4578275f, 0.40821073f});
+    sd::Tensor<float> std_dev({1, 1, 3, 1}, {0.26862954f, 0.26130258f, 0.27577711f});
+    return (scaled - mean) / std_dev;
+}
+
+static int run_clip_embeds_mode(int argc, char** argv) {
+    std::string clip_vision_path = aa_weights_root() + "/image_encoder/pytorch_model.bin";
+    std::string fixtures_dir;
+    if (const char* env = std::getenv("SDCPP_AA_FIXTURES")) {
+        fixtures_dir = env;
+    } else {
+        fixtures_dir = "/data/sdcpp-pixel-refs/fixtures";
+    }
+
+    for (int i = 0; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--clip-vision") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --clip-vision requires a value\n");
+                return 1;
+            }
+            clip_vision_path = argv[++i];
+        } else if (arg == "--fixtures") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --fixtures requires a value\n");
+                return 1;
+            }
+            fixtures_dir = argv[++i];
+        } else {
+            fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+            return 1;
+        }
+    }
+
+    std::string ref_image_path = fixtures_dir + "/ref.png";
+    std::string expected_path  = fixtures_dir + "/clip_embeds.npy";
+
+    // --- Load the reference image, ggml layout [W,H,3,N=1], values in [0,255] (NOT
+    // pre-divided by 255: aa_clip_preprocess needs raw byte values so its resize can
+    // round/clip to uint8 between passes, matching PIL - see aa_pil_bicubic_resize). ---
+    int width = 0, height = 0, channels_in_file = 0;
+    unsigned char* pixels = stbi_load(ref_image_path.c_str(), &width, &height, &channels_in_file, 3);
+    if (pixels == nullptr) {
+        fprintf(stderr, "error: failed to load ref image '%s'\n", ref_image_path.c_str());
+        return 1;
+    }
+    sd_image_t sd_image{static_cast<uint32_t>(width), static_cast<uint32_t>(height), 3, pixels};
+    sd::Tensor<float> ref_tensor = sd_image_to_tensor(sd_image, -1, -1, false);
+    free(pixels);
+    printf("ref image: %dx%d\n", width, height);
+
+    const int clip_image_size      = 224;
+    sd::Tensor<float> pixel_values = aa_clip_preprocess(ref_tensor, clip_image_size);
+
+    // --- Load the checkpoint. Diffusers CLIPVisionModelWithProjection state_dict
+    // keys are "vision_model.*" / "visual_projection.weight" verbatim, so an empty
+    // prefix binds tensors by name directly (same pattern as pose_guider.pth above).
+    auto model_manager = std::make_shared<ModelManager>();
+    model_manager->set_n_threads(1);
+    ModelLoader& model_loader = model_manager->loader();
+    if (!model_loader.init_from_file(clip_vision_path, "")) {
+        fprintf(stderr, "error: failed to load CLIP vision weights from '%s'\n", clip_vision_path.c_str());
+        return 1;
+    }
+
+    // The reference sd-image-variations pytorch_model.bin (like every HF
+    // transformers CLIPVisionModel checkpoint) carries transformers' well-known
+    // "pre_layrnorm" typo for the vision tower's pre-encoder LayerNorm. The fork's
+    // CLIPVisionModel block spells it correctly ("pre_layernorm"), and already has a
+    // rename for this exact typo in name_conversion.cpp:68-69 - but that mapping only
+    // fires on keys already carrying the "transformer." prefix added by the
+    // clip_vision. remap pipeline (stable-diffusion.cpp / name_conversion.cpp:1473),
+    // which a raw HF pytorch_model.bin loaded directly (as here, bypassing that
+    // pipeline) never gets. Rename the two affected keys in place so
+    // CLIPVisionModel's "pre_layernorm" block binds against the checkpoint.
+    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+    for (const std::string field : {"weight", "bias"}) {
+        std::string old_key = "vision_model.pre_layrnorm." + field;
+        std::string new_key = "vision_model.pre_layernorm." + field;
+        auto it              = tensor_storage_map.find(old_key);
+        if (it != tensor_storage_map.end()) {
+            TensorStorage storage = it->second;
+            storage.name          = new_key;
+            tensor_storage_map.erase(old_key);
+            tensor_storage_map.insert({new_key, storage});
+        }
+    }
+
+    ggml_backend_t cpu_backend = sd_backend_cpu_init();
+    if (cpu_backend == nullptr) {
+        fprintf(stderr, "error: failed to init CPU backend\n");
+        return 1;
+    }
+
+    ClipVisionRunner runner(cpu_backend, model_loader.get_tensor_storage_map(), model_manager);
+
+    std::map<std::string, ggml_tensor*> tensors;
+    runner.get_param_tensors(tensors);
+
+    bool proj_bound = false;
+    for (const auto& kv : tensors) {
+        if (kv.first.rfind("visual_projection.", 0) == 0) {
+            proj_bound = true;
+            break;
+        }
+    }
+    if (!proj_bound) {
+        fprintf(stderr, "error: no visual_projection.* parameter tensors were bound (init() failed to match checkpoint keys)\n");
+        return 1;
+    }
+    printf("visual_projection tensors bound: yes\n");
+
+    if (!model_manager->register_param_tensors("clip_vision",
+                                               tensors,
+                                               ModelManager::ResidencyMode::ParamBackend,
+                                               cpu_backend,
+                                               cpu_backend) ||
+        !model_manager->validate_registered_tensors()) {
+        fprintf(stderr, "error: failed to register CLIP vision tensors with the model manager\n");
+        return 1;
+    }
+
+    // --- Forward pass: projected image_embeds, shape ggml [projection_dim, N=1]. ---
+    sd::Tensor<float> output = runner.compute(1, pixel_values);
+
+    // Release the model manager (params backend buffers) before `runner` is
+    // destroyed at scope exit - same destructor-order precedent as
+    // run_pose_guider_mode above.
+    model_manager.reset();
+
+    if (output.empty()) {
+        fprintf(stderr, "error: CLIP vision forward pass failed\n");
+        return 1;
+    }
+    printf("output numel: %lld\n", (long long)output.numel());
+
+    // --- Load the reference embeddings and compare. ---
+    // Fixture shape is (2, 1, 768): row 0 = zeros uncond, row 1 = cond embed.
+    aa_test::NpyArray expected;
+    std::string npy_error;
+    if (!aa_test::load_npy_f32(expected_path, expected, npy_error)) {
+        fprintf(stderr, "error: %s\n", npy_error.c_str());
+        return 1;
+    }
+    printf("expected npy shape: [");
+    for (size_t i = 0; i < expected.shape.size(); ++i) {
+        printf("%s%lld", i == 0 ? "" : ", ", (long long)expected.shape[i]);
+    }
+    printf("]\n");
+
+    if (expected.shape.size() != 3 || expected.shape[0] != 2 || expected.shape[2] != output.numel()) {
+        fprintf(stderr,
+                "error: unexpected fixture shape (expected (2, N, %lld)) for output numel %lld\n",
+                (long long)output.numel(), (long long)output.numel());
+        return 1;
+    }
+
+    int64_t row_stride = expected.shape[1] * expected.shape[2];  // elements per batch row
+
+    // Deliverable: document the uncond convention - row 0 must be the literal zero
+    // vector (P-map section 8: "uncond = torch.zeros_like(...)"), not a text-model
+    // empty-prompt embedding.
+    const float* uncond_row = expected.data.data();
+    for (int64_t i = 0; i < row_stride; ++i) {
+        if (uncond_row[i] != 0.0f) {
+            fprintf(stderr, "error: fixture row 0 (uncond) is not all-zero at index %lld (value %g)\n",
+                    (long long)i, uncond_row[i]);
+            return 1;
+        }
+    }
+    printf("uncond row (row 0) verified all-zero: yes\n");
+
+    const float* cond_row = expected.data.data() + row_stride;
+    const float* got      = output.data();
+
+    double num = 0.0, den = 0.0;
+    for (int64_t i = 0; i < output.numel(); ++i) {
+        double diff = static_cast<double>(got[i]) - static_cast<double>(cond_row[i]);
+        num += diff * diff;
+        den += static_cast<double>(cond_row[i]) * static_cast<double>(cond_row[i]);
+    }
+    double rel_l2 = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+    printf("relative L2 error: %g\n", rel_l2);
+
+    const double tolerance = 1e-3;
+    if (rel_l2 > tolerance) {
+        fprintf(stderr, "FAIL: relative L2 error %g exceeds tolerance %g\n", rel_l2, tolerance);
+        return 1;
+    }
+
+    printf("PASS: CLIP vision embeds match reference within tolerance %g\n", tolerance);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     sd_set_log_callback(aa_test_log_cb, nullptr);
 
@@ -350,6 +771,8 @@ int main(int argc, char** argv) {
         return run_version_mode(argc - 2, argv + 2);
     } else if (mode == "pose-guider") {
         return run_pose_guider_mode(argc - 2, argv + 2);
+    } else if (mode == "clip-embeds") {
+        return run_clip_embeds_mode(argc - 2, argv + 2);
     } else if (mode == "-h" || mode == "--help") {
         print_usage();
         return 0;
