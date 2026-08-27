@@ -400,6 +400,12 @@ protected:
     bool ff_in;
 
 public:
+    // AnimateAnyone ReferenceNet bank index, assigned in stable DFS
+    // construction order by UnetModelBlock (16 blocks for SD1.5). -1 (the
+    // default) means "not part of a bank-capable UNet": the capture branch in
+    // forward() is then unreachable, so every existing family is unaffected.
+    int aa_bank_index = -1;
+
     BasicTransformerBlock(int64_t dim,
                           int64_t n_head,
                           int64_t d_head,
@@ -451,6 +457,20 @@ public:
 
         auto r = x;
         x      = norm1->forward(ctx, x);
+        if (ctx->aa_bank_capture != nullptr && aa_bank_index >= 0) {
+            // AnimateAnyone write mode (P-map section 2): bank the post-norm1,
+            // PRE-attention hidden states. ggml_cont produces a standalone copy
+            // so ggml_set_output can pin it without touching the layer's own
+            // dataflow; the copy is persisted via the runner cache under a
+            // stable name and also recorded on the capture handle.
+            ggml_tensor* banked = ggml_cont(ctx->ggml_ctx, x);
+            ggml_set_output(banked);
+            ctx->persist_cache_tensor("aa.bank." + std::to_string(aa_bank_index), banked);
+            if ((int)ctx->aa_bank_capture->tensors.size() <= aa_bank_index) {
+                ctx->aa_bank_capture->tensors.resize(aa_bank_index + 1, nullptr);
+            }
+            ctx->aa_bank_capture->tensors[aa_bank_index] = banked;
+        }
         x      = attn1->forward(ctx, x, x);  // self-attention
         x      = ggml_add(ctx->ggml_ctx, x, r);
         r      = x;
@@ -522,6 +542,19 @@ public:
             blocks["proj_out"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, in_channels));
         } else {
             blocks["proj_out"] = std::shared_ptr<GGMLBlock>(new Conv2d(inner_dim, in_channels, {1, 1}));
+        }
+    }
+
+    // Assigns AnimateAnyone bank indices to this transformer's
+    // BasicTransformerBlocks in depth order, advancing the caller's DFS
+    // counter. Only UnetModelBlock's construction path calls this; the indices
+    // are inert unless GGMLRunnerContext::aa_bank_capture is set at graph build.
+    void assign_aa_bank_indices(int& dfs_counter) {
+        for (int i = 0; i < depth; i++) {
+            auto block = std::dynamic_pointer_cast<BasicTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
+            if (block != nullptr) {
+                block->aa_bank_index = dfs_counter++;
+            }
         }
     }
 

@@ -230,6 +230,11 @@ public:
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
     std::shared_ptr<DiffusionModelRunner> diffusion_model;
     std::shared_ptr<DiffusionModelRunner> high_noise_diffusion_model;
+    // AnimateAnyone ReferenceNet: headless SD1.5 UNet (no output head), run
+    // once at t=0 to capture the 16 post-norm1 hidden-state banks. Typed as
+    // UNetModelRunner (not the DiffusionModelRunner base) because its only
+    // entry point is compute_reference_banks().
+    std::shared_ptr<UNetModelRunner> reference_net;
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<AudioVAERunner> audio_vae_model;
@@ -728,6 +733,13 @@ public:
             LOG_INFO("loading high noise diffusion model from '%s'", sd_ctx_params->high_noise_diffusion_model_path);
             if (!model_loader.init_from_file(sd_ctx_params->high_noise_diffusion_model_path, "model.high_noise_diffusion_model.")) {
                 LOG_WARN("loading diffusion model from '%s' failed", sd_ctx_params->high_noise_diffusion_model_path);
+            }
+        }
+
+        if (strlen(SAFE_STR(sd_ctx_params->reference_net_path)) > 0) {
+            LOG_INFO("loading reference net from '%s'", sd_ctx_params->reference_net_path);
+            if (!model_loader.init_from_file(sd_ctx_params->reference_net_path, "model.reference_net.")) {
+                LOG_WARN("loading reference net from '%s' failed", sd_ctx_params->reference_net_path);
             }
         }
 
@@ -1356,6 +1368,17 @@ public:
                     LOG_INFO("Using Conv2d direct in the diffusion model");
                     diffusion_model->set_conv2d_direct_enabled(true);
                 }
+                if (strlen(SAFE_STR(sd_ctx_params->reference_net_path)) > 0) {
+                    // AnimateAnyone ReferenceNet: second UNet runner (high_noise
+                    // precedent), headless because reference_unet.pth has no
+                    // conv_norm_out/conv_out tensors (P-map section 1).
+                    reference_net = std::make_shared<UNetModelRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                      tensor_storage_map,
+                                                                      "model.reference_net",
+                                                                      version,
+                                                                      model_manager,
+                                                                      /*reference_headless=*/true);
+                }
             }
 
             cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::TE));
@@ -1380,6 +1403,17 @@ public:
                 high_noise_diffusion_model->set_stream_layers_enabled(stream_layers);
                 if (!register_runner_params("High noise diffusion model",
                                             high_noise_diffusion_model,
+                                            SDBackendModule::DIFFUSION,
+                                            &unet_params_mem_size)) {
+                    return false;
+                }
+            }
+
+            if (reference_net) {
+                reference_net->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::DIFFUSION));
+                reference_net->set_stream_layers_enabled(stream_layers);
+                if (!register_runner_params("Reference net",
+                                            reference_net,
                                             SDBackendModule::DIFFUSION,
                                             &unet_params_mem_size)) {
                     return false;
@@ -1651,6 +1685,9 @@ public:
                 diffusion_model->set_flash_attention_enabled(true);
                 if (high_noise_diffusion_model) {
                     high_noise_diffusion_model->set_flash_attention_enabled(true);
+                }
+                if (reference_net) {
+                    reference_net->set_flash_attention_enabled(true);
                 }
             }
         }
@@ -2492,6 +2529,22 @@ public:
                 *last_progress_us = now;
             }
         }
+    }
+
+    // AnimateAnyone: run the ReferenceNet once at t=0 with the CFG-doubled ref
+    // latents ([64,64,4,2], both halves identical) and CFG-paired CLIP image
+    // embeds ([768,1,2], row 0 zeros uncond / row 1 cond) and return the 16
+    // post-norm1 hidden-state banks as host tensors in descending-norm1-width
+    // stable order (see UNetModelRunner::aa_bank_capture_order). The banks are
+    // timestep-independent and reused unchanged across all denoising steps
+    // (P-map section 2); the read side is wired in task 7.
+    std::vector<sd::Tensor<float>> compute_reference_banks(const sd::Tensor<float>& ref_latents_cfg2,
+                                                           const sd::Tensor<float>& clip_embeds_cfg2) {
+        if (reference_net == nullptr) {
+            LOG_ERROR("compute_reference_banks called without a loaded reference net");
+            return {};
+        }
+        return reference_net->compute_reference_banks(n_threads, ref_latents_cfg2, clip_embeds_cfg2);
     }
 
     void compute_sample_controls(const sd::Tensor<float>& control_image,

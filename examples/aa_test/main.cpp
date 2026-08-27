@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "model.h"
@@ -25,7 +26,9 @@
 #include "core/tensor.hpp"
 #include "core/util.h"
 #include "model/adapter/pose_guider.hpp"
+#include "model/diffusion/unet.hpp"
 #include "model/te/clip.hpp"
+#include "model/vae/auto_encoder_kl.hpp"
 
 #include "npy.hpp"
 #include "json.hpp"
@@ -88,7 +91,16 @@ static void print_usage() {
             "      alphas_cumprod, the 25-step trailing timestep grid, and one DDIM\n"
             "      v-prediction step) against <fixtures>/sched_v2.json (default fixtures\n"
             "      dir: $SDCPP_AA_FIXTURES or /data/sdcpp-pixel-refs/fixtures). Exits 0\n"
-            "      only if all three checks pass, 1 otherwise.\n");
+            "      only if all three checks pass, 1 otherwise.\n"
+            "  ref-bank [--vae <path>] [--reference-net <path>] [--fixtures <dir>] [--threads <n>]\n"
+            "      (a) VAE-encodes <fixtures>/ref.png with sd-vae-ft-mse (distribution MEAN,\n"
+            "      scaled by 0.18215) and compares against <fixtures>/ref_latents.npy at\n"
+            "      rel L2 <= 1e-3. (b) Runs the headless ReferenceNet (reference_unet.pth)\n"
+            "      one forward at t=0 with the CFG-doubled ref latents and\n"
+            "      <fixtures>/clip_embeds.npy as cross-attn context, captures the 16\n"
+            "      post-norm1 hidden-state banks, and compares each against\n"
+            "      <fixtures>/ref_bank_00..15.npy at rel L2 <= 1e-3. Prints the per-bank\n"
+            "      error table and the worst bank. Exits 0 only if all checks pass.\n");
 }
 
 static int run_version_mode(int argc, char** argv) {
@@ -1021,6 +1033,294 @@ static int run_scheduler_mode(int argc, char** argv) {
     return 0;
 }
 
+// mode `ref-bank`: ReferenceNet forward with hidden-state bank capture (task 6).
+//
+// (a) VAE mean-path encode: the reference pipeline encodes the ref image with
+//     `vae.encode(...).latent_dist.mean * 0.18215` (P-map section 8) - the
+//     distribution MEAN, not a sample. The fork's AutoEncoderKL encoder returns
+//     the raw moments [.., 2*latent_channels, ..]; the mean is the first chunk
+//     along the channel dim (gaussian_latent_sample takes chunk 0 as mean too).
+// (b) Bank capture: one headless-UNet forward at t=0 with the CFG-doubled ref
+//     latents (both halves identical) and the CFG-paired CLIP embeds
+//     (row 0 zeros uncond, row 1 cond) as cross-attn context. The 16
+//     post-norm1 hidden states are read back in descending-norm1-width stable
+//     order and compared per bank against ref_bank_00..15.npy.
+static int run_ref_bank_mode(int argc, char** argv) {
+    std::string vae_path           = aa_weights_root() + "/sd-vae-ft-mse/diffusion_pytorch_model.safetensors";
+    std::string reference_net_path = aa_weights_root() + "/AnimateAnyone/reference_unet.pth";
+    std::string fixtures_dir;
+    if (const char* env = std::getenv("SDCPP_AA_FIXTURES")) {
+        fixtures_dir = env;
+    } else {
+        fixtures_dir = "/data/sdcpp-pixel-refs/fixtures";
+    }
+    int n_threads = static_cast<int>(std::thread::hardware_concurrency());
+    if (n_threads <= 0) {
+        n_threads = 4;
+    }
+
+    for (int i = 0; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--vae") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --vae requires a value\n");
+                return 1;
+            }
+            vae_path = argv[++i];
+        } else if (arg == "--reference-net") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --reference-net requires a value\n");
+                return 1;
+            }
+            reference_net_path = argv[++i];
+        } else if (arg == "--fixtures") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --fixtures requires a value\n");
+                return 1;
+            }
+            fixtures_dir = argv[++i];
+        } else if (arg == "--threads") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --threads requires a value\n");
+                return 1;
+            }
+            n_threads = std::atoi(argv[++i]);
+        } else {
+            fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+            return 1;
+        }
+    }
+
+    auto rel_l2 = [](const float* got, const float* want, int64_t n) -> double {
+        double num = 0.0, den = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            double diff = static_cast<double>(got[i]) - static_cast<double>(want[i]);
+            num += diff * diff;
+            den += static_cast<double>(want[i]) * static_cast<double>(want[i]);
+        }
+        return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+    };
+
+    ggml_backend_t cpu_backend = sd_backend_cpu_init();
+    if (cpu_backend == nullptr) {
+        fprintf(stderr, "error: failed to init CPU backend\n");
+        return 1;
+    }
+
+    // --- Reference latents fixture (needed by both halves: comparison target for
+    // (a), UNet input for (b)). Shape (1,4,64,64) numpy C-order == ggml
+    // [64,64,4,1] flat layout (same flat-index formula, see pose-guider mode). ---
+    aa_test::NpyArray ref_latents_npy;
+    std::string npy_error;
+    if (!aa_test::load_npy_f32(fixtures_dir + "/ref_latents.npy", ref_latents_npy, npy_error)) {
+        fprintf(stderr, "error: %s\n", npy_error.c_str());
+        return 1;
+    }
+    if (ref_latents_npy.shape.size() != 4 || ref_latents_npy.shape[0] != 1 || ref_latents_npy.shape[1] != 4 ||
+        ref_latents_npy.shape[2] != 64 || ref_latents_npy.shape[3] != 64) {
+        fprintf(stderr, "error: unexpected ref_latents.npy shape (expected (1,4,64,64))\n");
+        return 1;
+    }
+
+    // ============================ (a) VAE mean-path encode ============================
+    bool vae_pass = false;
+    {
+        int width = 0, height = 0, channels_in_file = 0;
+        unsigned char* pixels = stbi_load((fixtures_dir + "/ref.png").c_str(), &width, &height, &channels_in_file, 3);
+        if (pixels == nullptr) {
+            fprintf(stderr, "error: failed to load ref image '%s/ref.png'\n", fixtures_dir.c_str());
+            return 1;
+        }
+        sd_image_t sd_image{static_cast<uint32_t>(width), static_cast<uint32_t>(height), 3, pixels};
+        // [0,1] here; VAE::encode's scale_input then rescales to [-1,1], matching the
+        // reference VaeImageProcessor(do_normalize=True) preprocessing.
+        sd::Tensor<float> ref_tensor = sd_image_to_tensor(sd_image, -1, -1, true);
+        free(pixels);
+        printf("ref image: %dx%d\n", width, height);
+
+        auto vae_manager = std::make_shared<ModelManager>();
+        vae_manager->set_n_threads(1);
+        ModelLoader& vae_loader = vae_manager->loader();
+        // "vae." prefix + name conversion maps the diffusers VAE state dict to the
+        // fork's LDM-style "first_stage_model.*" names (name_conversion.cpp prefix map).
+        if (!vae_loader.init_from_file_and_convert_name(vae_path, "vae.", VERSION_SD1)) {
+            fprintf(stderr, "error: failed to load VAE from '%s'\n", vae_path.c_str());
+            return 1;
+        }
+
+        AutoEncoderKL vae(cpu_backend, vae_loader.get_tensor_storage_map(), "first_stage_model",
+                          /*decode_only=*/false, /*use_video_decoder=*/false, VERSION_SD1, vae_manager);
+
+        std::map<std::string, ggml_tensor*> vae_tensors;
+        vae.get_param_tensors(vae_tensors);
+        if (!vae_manager->register_param_tensors("vae", vae_tensors,
+                                                 ModelManager::ResidencyMode::ParamBackend,
+                                                 cpu_backend, cpu_backend) ||
+            !vae_manager->validate_registered_tensors()) {
+            fprintf(stderr, "error: failed to register VAE tensors with the model manager\n");
+            return 1;
+        }
+
+        sd_tiling_params_t no_tiling{};
+        sd::Tensor<float> moments = vae.encode(n_threads, ref_tensor, no_tiling);
+        // Release the manager before `vae` leaves scope - destructor-order precedent,
+        // see run_pose_guider_mode.
+        vae_manager.reset();
+        if (moments.empty()) {
+            fprintf(stderr, "error: VAE encode failed\n");
+            return 1;
+        }
+
+        // moments [64,64,8,1] -> distribution mean = channels 0..3, * 0.18215
+        // (latent_dist.mean path; NOT gaussian_latent_sample - no noise).
+        sd::Tensor<float> mean    = sd::ops::chunk(moments, 2, 2)[0];
+        sd::Tensor<float> latents = mean * 0.18215f;
+
+        if (latents.numel() != ref_latents_npy.numel()) {
+            fprintf(stderr, "error: VAE latents element count mismatch: got %lld expected %lld\n",
+                    (long long)latents.numel(), (long long)ref_latents_npy.numel());
+            return 1;
+        }
+        double vae_rel_l2 = rel_l2(latents.data(), ref_latents_npy.data.data(), latents.numel());
+        printf("(a) VAE mean-path latents relative L2 error: %g (tolerance 1e-3)\n", vae_rel_l2);
+        vae_pass = vae_rel_l2 <= 1e-3;
+        if (!vae_pass) {
+            fprintf(stderr, "FAIL: (a) VAE latents relative L2 error %g exceeds tolerance 1e-3\n", vae_rel_l2);
+        }
+    }
+
+    // ============================ (b) ReferenceNet banks ============================
+    // CFG-doubled inputs: latents duplicated (both halves identical), CLIP embeds
+    // row 0 = zeros uncond / row 1 = cond (P-map section 2 write mode).
+    aa_test::NpyArray clip_embeds_npy;
+    if (!aa_test::load_npy_f32(fixtures_dir + "/clip_embeds.npy", clip_embeds_npy, npy_error)) {
+        fprintf(stderr, "error: %s\n", npy_error.c_str());
+        return 1;
+    }
+    if (clip_embeds_npy.shape.size() != 3 || clip_embeds_npy.shape[0] != 2 ||
+        clip_embeds_npy.shape[1] != 1 || clip_embeds_npy.shape[2] != 768) {
+        fprintf(stderr, "error: unexpected clip_embeds.npy shape (expected (2,1,768))\n");
+        return 1;
+    }
+
+    const int64_t latent_numel = ref_latents_npy.numel();
+    sd::Tensor<float> x({64, 64, 4, 2});
+    std::copy(ref_latents_npy.data.begin(), ref_latents_npy.data.end(), x.data());
+    std::copy(ref_latents_npy.data.begin(), ref_latents_npy.data.end(), x.data() + latent_numel);
+
+    // (2,1,768) numpy C-order == ggml [768,1,2] flat layout.
+    sd::Tensor<float> context({768, 1, 2});
+    std::copy(clip_embeds_npy.data.begin(), clip_embeds_npy.data.end(), context.data());
+
+    auto unet_manager = std::make_shared<ModelManager>();
+    unet_manager->set_n_threads(1);
+    ModelLoader& unet_loader = unet_manager->loader();
+    // "model.reference_net." is a registered diffusion-model prefix (task 2), so the
+    // diffusers-format reference_unet.pth keys are converted to the fork's original
+    // SD1 UNet names under that prefix.
+    if (!unet_loader.init_from_file_and_convert_name(reference_net_path, "model.reference_net.", VERSION_SD1)) {
+        fprintf(stderr, "error: failed to load reference net from '%s'\n", reference_net_path.c_str());
+        return 1;
+    }
+
+    UNetModelRunner runner(cpu_backend, unet_loader.get_tensor_storage_map(), "model.reference_net",
+                           VERSION_SD1, unet_manager, /*reference_headless=*/true);
+    if (!runner.config.reference_headless) {
+        fprintf(stderr, "error: reference_headless flag was not applied to the UNet config\n");
+        return 1;
+    }
+
+    std::map<std::string, ggml_tensor*> unet_tensors;
+    runner.get_param_tensors(unet_tensors, "model.reference_net");
+    // Headless invariant: no out.0/out.2 params may exist (checkpoint omits them;
+    // strict binding would otherwise report missing tensors).
+    for (const auto& kv : unet_tensors) {
+        if (kv.first.rfind("model.reference_net.out.", 0) == 0) {
+            fprintf(stderr, "error: headless ReferenceNet still allocated output-head param '%s'\n", kv.first.c_str());
+            return 1;
+        }
+    }
+    if (!unet_manager->register_param_tensors("reference_net", unet_tensors,
+                                              ModelManager::ResidencyMode::ParamBackend,
+                                              cpu_backend, cpu_backend) ||
+        !unet_manager->validate_registered_tensors()) {
+        fprintf(stderr, "error: failed to register reference net tensors with the model manager\n");
+        return 1;
+    }
+
+    printf("(b) running ReferenceNet forward at t=0 (batch 2, %d threads)...\n", n_threads);
+    std::vector<sd::Tensor<float>> banks = runner.compute_reference_banks(n_threads, x, context);
+    unet_manager.reset();
+    if (banks.size() != 16) {
+        fprintf(stderr, "error: compute_reference_banks returned %zu banks (expected 16)\n", banks.size());
+        return 1;
+    }
+
+    // Expected per-bank (width, tokens) in bank order: descending norm1 width,
+    // ties broken by the reference torch_dfs order down_blocks -> up_blocks ->
+    // mid_block (diffusers registers the empty up_blocks ModuleList before
+    // creating mid_block). Verified against the fixture manifest: the single
+    // 64-token 1280-wide bank (mid, 8x8) is bank 05, after the up-block 1280s.
+    static const int64_t expected_width[16]  = {1280, 1280, 1280, 1280, 1280, 1280,
+                                                640, 640, 640, 640, 640,
+                                                320, 320, 320, 320, 320};
+    static const int64_t expected_tokens[16] = {256, 256, 256, 256, 256, 64,
+                                                1024, 1024, 1024, 1024, 1024,
+                                                4096, 4096, 4096, 4096, 4096};
+
+    bool banks_pass       = true;
+    double worst_rel_l2   = 0.0;
+    int worst_bank        = -1;
+    const double bank_tol = 1e-3;
+    for (int i = 0; i < 16; ++i) {
+        char bank_name[32];
+        snprintf(bank_name, sizeof(bank_name), "ref_bank_%02d.npy", i);
+        aa_test::NpyArray expected;
+        if (!aa_test::load_npy_f32(fixtures_dir + "/" + bank_name, expected, npy_error)) {
+            fprintf(stderr, "error: %s\n", npy_error.c_str());
+            return 1;
+        }
+        // Fixture (2, L, C) numpy C-order == ggml [C, L, 2] flat layout.
+        if (expected.shape.size() != 3 || expected.shape[0] != 2 ||
+            expected.shape[1] != expected_tokens[i] || expected.shape[2] != expected_width[i]) {
+            fprintf(stderr, "error: bank %02d fixture shape mismatch vs expected (2,%lld,%lld)\n",
+                    i, (long long)expected_tokens[i], (long long)expected_width[i]);
+            return 1;
+        }
+        const auto& got = banks[i];
+        if (got.dim() != 3 || got.shape()[0] != expected_width[i] ||
+            got.shape()[1] != expected_tokens[i] || got.shape()[2] != 2) {
+            fprintf(stderr,
+                    "error: bank %02d shape mismatch: got ggml [%lld,%lld,%lld], expected [%lld,%lld,2] "
+                    "(wrong bank-order mapping?)\n",
+                    i,
+                    (long long)got.shape()[0], (long long)(got.dim() > 1 ? got.shape()[1] : -1),
+                    (long long)(got.dim() > 2 ? got.shape()[2] : -1),
+                    (long long)expected_width[i], (long long)expected_tokens[i]);
+            return 1;
+        }
+        double err = rel_l2(got.data(), expected.data.data(), got.numel());
+        bool pass  = err <= bank_tol;
+        printf("(b) bank %02d [C=%4lld, L=%4lld]: rel L2 %-12g %s\n",
+               i, (long long)expected_width[i], (long long)expected_tokens[i], err, pass ? "ok" : "FAIL");
+        if (err > worst_rel_l2) {
+            worst_rel_l2 = err;
+            worst_bank   = i;
+        }
+        banks_pass = banks_pass && pass;
+    }
+    printf("(b) worst bank: %02d, rel L2 %g (tolerance %g)\n", worst_bank, worst_rel_l2, bank_tol);
+    if (!banks_pass) {
+        fprintf(stderr, "FAIL: (b) at least one reference bank exceeds tolerance %g\n", bank_tol);
+    }
+
+    if (!vae_pass || !banks_pass) {
+        return 1;
+    }
+    printf("PASS: VAE mean-path latents and all 16 reference banks match within tolerance\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     sd_set_log_callback(aa_test_log_cb, nullptr);
 
@@ -1038,6 +1338,8 @@ int main(int argc, char** argv) {
         return run_clip_embeds_mode(argc - 2, argv + 2);
     } else if (mode == "scheduler") {
         return run_scheduler_mode(argc - 2, argv + 2);
+    } else if (mode == "ref-bank") {
+        return run_ref_bank_mode(argc - 2, argv + 2);
     } else if (mode == "-h" || mode == "--help") {
         print_usage();
         return 0;

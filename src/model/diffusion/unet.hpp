@@ -32,12 +32,20 @@ struct UNetConfig {
     int adm_in_channels                    = 2816;  // only for VERSION_SDXL/SVD
     bool enable_animatediff                = false;
     bool animatediff_has_mid_block         = false;
+    // AnimateAnyone ReferenceNet: the checkpoint deletes the output head
+    // (conv_norm_out/conv_out, P-map section 1), so when set the UNet block
+    // neither creates nor runs out.0/out.2 and forward returns the last
+    // up-block hidden states. Defaults to false: every existing family keeps
+    // the output head exactly as before.
+    bool reference_headless                = false;
 
     static UNetConfig detect_from_weights(const String2TensorStorage& tensor_storage_map,
                                           const std::string& prefix,
-                                          SDVersion version = VERSION_SD1) {
+                                          SDVersion version       = VERSION_SD1,
+                                          bool reference_headless = false) {
         UNetConfig config;
-        config.version = version;
+        config.version            = version;
+        config.reference_headless = reference_headless;
 
         if (sd_version_is_sd2(version)) {
             config.context_dim           = 1024;
@@ -349,20 +357,29 @@ public:
             }
         };
 
+        // AnimateAnyone bank indices: get_attention_layer is called in exactly
+        // the forward/DFS order (input blocks, middle block, output blocks), so
+        // a running counter at construction time yields stable DFS indices
+        // (0..15 for SD1.5). Assignment is unconditional but inert: the indices
+        // are only ever read when GGMLRunnerContext::aa_bank_capture is set.
+        int aa_bank_dfs_counter  = 0;
         auto get_attention_layer = [&](int64_t in_channels,
                                        int64_t n_head,
                                        int64_t d_head,
                                        int64_t depth,
                                        int64_t context_dim) -> SpatialTransformer* {
+            SpatialTransformer* layer = nullptr;
             if (version == VERSION_SVD) {
-                return new SpatialVideoTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection);
+                layer = new SpatialVideoTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection);
             } else {
                 if (version == VERSION_SDXS_09 && n_head == 5) {
                     n_head = 1;    // to carry a special case of sdxs_09 into CrossAttentionLayer,
                     d_head = 320;  // works as long the product remains equal (5*64 == 1*320)
                 }
-                return new SpatialTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection);
+                layer = new SpatialTransformer(in_channels, n_head, d_head, depth, context_dim, use_linear_projection);
             }
+            layer->assign_aa_bank_indices(aa_bank_dfs_counter);
+            return layer;
         };
 
         size_t len_mults = channel_mult.size();
@@ -479,10 +496,14 @@ public:
             }
         }
 
-        // out
-        blocks["out.0"] = std::shared_ptr<GGMLBlock>(new GroupNorm32(ch));  // ch == model_channels
-        // out_1 is nn.SiLU()
-        blocks["out.2"] = std::shared_ptr<GGMLBlock>(new Conv2d(model_channels, out_channels, {3, 3}, {1, 1}, {1, 1}));
+        // out (skipped for the AnimateAnyone ReferenceNet: its checkpoint has
+        // no conv_norm_out/conv_out tensors, so allocating the params here
+        // would leave them unbound at strict load)
+        if (!this->config.reference_headless) {
+            blocks["out.0"] = std::shared_ptr<GGMLBlock>(new GroupNorm32(ch));  // ch == model_channels
+            // out_1 is nn.SiLU()
+            blocks["out.2"] = std::shared_ptr<GGMLBlock>(new Conv2d(model_channels, out_channels, {3, 3}, {1, 1}, {1, 1}));
+        }
 
         if (this->config.enable_animatediff) {
             AnimateDiff::MotionModuleConfig mm_cfg;
@@ -568,8 +589,14 @@ public:
         auto time_embed_2     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.2"]);
         auto input_blocks_0_0 = std::dynamic_pointer_cast<Conv2d>(blocks["input_blocks.0.0"]);
 
-        auto out_0 = std::dynamic_pointer_cast<GroupNorm32>(blocks["out.0"]);
-        auto out_2 = std::dynamic_pointer_cast<Conv2d>(blocks["out.2"]);
+        // Headless ReferenceNet has no out.0/out.2 blocks at all; blocks[] with
+        // operator[] would insert null entries, so only fetch them when present.
+        std::shared_ptr<GroupNorm32> out_0;
+        std::shared_ptr<Conv2d> out_2;
+        if (!config.reference_headless) {
+            out_0 = std::dynamic_pointer_cast<GroupNorm32>(blocks["out.0"]);
+            out_2 = std::dynamic_pointer_cast<Conv2d>(blocks["out.2"]);
+        }
 
         auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, model_channels);  // [N, model_channels]
 
@@ -736,12 +763,16 @@ public:
             }
         }
 
-        // out
-        h = out_0->forward(ctx, h);
-        h = ggml_silu_inplace(ctx->ggml_ctx, h);
-        h = out_2->forward(ctx, h);
+        // out (P-map section 1: the ReferenceNet forward stops before
+        // conv_norm_out/conv_out and returns the raw last up-block output; the
+        // value is only computed for its bank-capture side effects)
+        if (!config.reference_headless) {
+            h = out_0->forward(ctx, h);
+            h = ggml_silu_inplace(ctx->ggml_ctx, h);
+            h = out_2->forward(ctx, h);
+        }
         ggml_set_name(h, "bench-end");
-        return h;  // [N, out_channels, h, w]
+        return h;  // [N, out_channels, h, w] ([N, model_channels, h, w] when reference_headless)
     }
 };
 
@@ -749,20 +780,46 @@ struct UNetModelRunner : public DiffusionModelRunner {
     UNetConfig config;
     UnetModelBlock unet;
 
+    // AnimateAnyone ReferenceNet bank capture state. aa_capture_banks is only
+    // ever set inside compute_reference_banks(); every normal compute() path
+    // leaves it false, so the capture context member stays nullptr and the
+    // graph is byte-identical to before.
+    bool aa_capture_banks = false;
+    AABankCapture aa_bank_capture_state;
+
     UNetModelRunner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map,
                     const std::string prefix,
                     SDVersion version                                   = VERSION_SD1,
-                    std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                    std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                    bool reference_headless                             = false)
         : DiffusionModelRunner(backend, prefix, weight_manager),
-          config(UNetConfig::detect_from_weights(tensor_storage_map, prefix, version)),
+          config(UNetConfig::detect_from_weights(tensor_storage_map, prefix, version, reference_headless)),
           unet(config) {
+        if (config.reference_headless) {
+            // ReferenceNet precision: reference_unet.pth is fp32 and the bank
+            // fixtures require rel L2 <= 1e-3 per bank; with the default F16
+            // conv kernels the accumulated conv error alone exceeds that
+            // (measured worst bank 1.5e-3). Force F32 conv kernels for this
+            // runner only - normal generation runners are untouched.
+            std::vector<GGMLBlock*> all_blocks;
+            unet.get_all_blocks(all_blocks);
+            for (GGMLBlock* block : all_blocks) {
+                if (block->get_desc() == "Conv2d") {
+                    static_cast<Conv2d*>(block)->set_force_f32(true);
+                }
+            }
+        }
         unet.init(params_ctx, tensor_storage_map, prefix);
     }
 
     std::string get_desc() override {
         return "unet";
     }
+
+    // Un-hide the base's single-arg overload (uses the runner's own prefix) so
+    // callers holding a concrete UNetModelRunner pointer can use it too.
+    using DiffusionModelRunner::get_param_tensors;
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
         unet.get_param_tensors(tensors, prefix);
@@ -799,6 +856,10 @@ struct UNetModelRunner : public DiffusionModelRunner {
         auto runner_ctx       = get_context();
         runner_ctx.ip_context = ip_context;
         runner_ctx.ip_scale   = ip_scale;
+        if (aa_capture_banks) {
+            aa_bank_capture_state.tensors.clear();
+            runner_ctx.aa_bank_capture = &aa_bank_capture_state;
+        }
 
         ggml_tensor* out = unet.forward(&runner_ctx,
                                         x,
@@ -855,6 +916,70 @@ struct UNetModelRunner : public DiffusionModelRunner {
                        extra->control_strength,
                        extra->ip_context ? *extra->ip_context : sd::Tensor<float>{},
                        extra->ip_scale);
+    }
+
+    // AnimateAnyone ReferenceNet: one forward at t=0 with the CFG-doubled ref
+    // latents and CFG-paired CLIP embeds; returns the 16 post-norm1 hidden
+    // state banks as host tensors, each ggml [C, L, 2].
+    //
+    // Bank order (P-map section 2): the reference sorts all 16
+    // BasicTransformerBlocks by DESCENDING norm1 width with a stable sort, so
+    // ties break by the reference's torch_dfs module order. In diffusers'
+    // UNet2DConditionModel the empty up_blocks ModuleList is registered before
+    // mid_block is created (unet_2d_condition.py:455-456 vs :531), so that DFS
+    // order is down_blocks -> up_blocks -> mid_block. Our capture indices are
+    // this UNet's forward/DFS construction order:
+    //   capture 0..1  = input_blocks 1,2   (320ch, 64x64)
+    //   capture 2..3  = input_blocks 4,5   (640ch, 32x32)
+    //   capture 4..5  = input_blocks 7,8   (1280ch, 16x16)
+    //   capture 6     = middle_block       (1280ch, 8x8)
+    //   capture 7..9  = output_blocks 3..5 (1280ch, 16x16)
+    //   capture 10..12= output_blocks 6..8 (640ch, 32x32)
+    //   capture 13..15= output_blocks 9..11(320ch, 64x64)
+    // Descending width (1280 x6, 640 x5, 320 x5) with down->up->mid tie-break
+    // therefore maps bank index -> capture index as below. Verified against the
+    // fixture manifest: the single 64-token 1280-wide bank (mid) is bank 05.
+    static const int* aa_bank_capture_order() {
+        static const int order[16] = {4, 5, 7, 8, 9, 6,
+                                      2, 3, 10, 11, 12,
+                                      0, 1, 13, 14, 15};
+        return order;
+    }
+
+    std::vector<sd::Tensor<float>> compute_reference_banks(int n_threads,
+                                                           const sd::Tensor<float>& ref_latents_cfg2,
+                                                           const sd::Tensor<float>& clip_embeds_cfg2) {
+        std::vector<sd::Tensor<float>> banks;
+        if (ref_latents_cfg2.dim() != 4) {
+            LOG_ERROR("compute_reference_banks expects 4-D latents");
+            return banks;
+        }
+        const int64_t n = ref_latents_cfg2.shape()[3];
+        std::vector<float> timesteps_vec(static_cast<size_t>(n), 0.f);  // one forward at t=0
+        auto timesteps = sd::Tensor<float>::from_vector(timesteps_vec);
+
+        aa_capture_banks = true;
+        auto out         = compute(n_threads, ref_latents_cfg2, timesteps, clip_embeds_cfg2);
+        aa_capture_banks = false;
+        if (out.empty()) {
+            LOG_ERROR("reference net forward failed");
+            return banks;
+        }
+
+        const int* order = aa_bank_capture_order();
+        banks.reserve(16);
+        for (int i = 0; i < 16; i++) {
+            std::string name  = "aa.bank." + std::to_string(order[i]);
+            ggml_tensor* bank = get_cache_tensor_by_name(name);
+            if (bank == nullptr) {
+                LOG_ERROR("reference bank tensor '%s' missing from cache", name.c_str());
+                banks.clear();
+                return banks;
+            }
+            banks.push_back(sd::make_sd_tensor_from_ggml<float>(bank));
+        }
+        free_cache_ctx_and_buffer();
+        return banks;
     }
 
     void test() {
