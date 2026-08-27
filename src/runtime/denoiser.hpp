@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <map>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "core/ggml_extend.hpp"
 #include "core/tensor.hpp"
@@ -1350,6 +1352,112 @@ inline sd::Tensor<float> ddim_v_pred_step(const sd::Tensor<float>& x_t,
 }
 
 }  // namespace animate_anyone_scheduler
+
+// Sliding-window long-video context scheduler (Task 10), ported faithfully from
+// moore-animate-anyone src/pipelines/context.py: ordered_halving() and uniform()
+// (context.py:8-42). Used by generate_animate_anyone() when the requested frame
+// count exceeds the motion module's context window (24 frames): the full clip is
+// denoised as a set of overlapping windows per timestep, whose UNet outputs are
+// scatter-accumulated and averaged before the single scheduler step (the
+// pipeline_pose2vid_long.py __call__ pattern).
+namespace animate_anyone_context {
+
+// diffusers/moore ordered_halving(val): reverse the 64-bit binary representation
+// of val and read it back as an integer in [0, 2^64), then divide by 2^64. This
+// is a bit-reversal permutation (a van der Corput / Halton-style sequence), not
+// an arithmetic transform -- transcribed bit-for-bit rather than approximated.
+// val is always non-negative here (a diffusion step index), so no sign handling
+// is needed.
+inline double ordered_halving(int64_t val) {
+    uint64_t v = (uint64_t)val;
+    uint64_t r = 0;
+    for (int i = 0; i < 64; i++) {
+        r = (r << 1) | (v & 1ULL);
+        v >>= 1;
+    }
+    // r / 2^64, computed via ldexp to avoid the (1ULL << 64) UB/overflow a
+    // literal shift-by-64 on a 64-bit type would hit.
+    return std::ldexp((double)r, -64);
+}
+
+// context.py uniform(step, num_steps, num_frames, context_size, context_stride,
+// context_overlap, closed_loop). num_steps is accepted for signature fidelity
+// but -- exactly as in the Python original -- never read: uniform()'s body
+// never references it. Returns the full window list (context_queue) for one
+// call, in yield order.
+//
+// Note: Python's round() is banker's-rounding (round-half-to-even); this uses
+// std::lround (round-half-away-from-zero) for `pad`. The two differ only on
+// an exact .5 tie, and every caller in this codebase passes step=0, for which
+// ordered_halving(0)==0.0 and pad==0 unconditionally -- so the discrepancy is
+// dead code here, kept only because the brief calls for a faithful general
+// port rather than a step=0-specialized one.
+inline std::vector<std::vector<int>> uniform(int64_t step,
+                                              int /*num_steps*/,
+                                              int num_frames,
+                                              int context_size,
+                                              int context_stride,
+                                              int context_overlap,
+                                              bool closed_loop) {
+    std::vector<std::vector<int>> windows;
+
+    if (num_frames <= context_size) {
+        std::vector<int> w(num_frames);
+        for (int i = 0; i < num_frames; i++) {
+            w[i] = i;
+        }
+        windows.push_back(std::move(w));
+        return windows;
+    }
+
+    // context_stride = min(context_stride, ceil(log2(num_frames/context_size)) + 1)
+    int stride_cap = (int)std::ceil(std::log2((double)num_frames / (double)context_size)) + 1;
+    int stride_lim = std::min(context_stride, stride_cap);
+
+    double oh = ordered_halving(step);
+    for (int s = 0; s < stride_lim; s++) {
+        int context_step = 1 << s;
+        int pad           = (int)std::lround((double)num_frames * oh);
+        int j_start        = (int)(oh * (double)context_step) + pad;  // python int() truncates
+        int j_end          = num_frames + pad + (closed_loop ? 0 : -context_overlap);
+        int j_step         = context_size * context_step - context_overlap;
+        if (j_step <= 0) {
+            // Guard against a non-positive Python range() step (would be an
+            // infinite/empty loop there); not reachable with the v2 defaults
+            // (24/1/4) at any context_stride the loop above can produce.
+            continue;
+        }
+        for (int j = j_start; j < j_end; j += j_step) {
+            std::vector<int> w;
+            w.reserve(context_size);
+            for (int k = 0; k < context_size; k++) {
+                int e = j + k * context_step;
+                int m = e % num_frames;
+                if (m < 0) {
+                    m += num_frames;
+                }
+                w.push_back(m);
+            }
+            windows.push_back(std::move(w));
+        }
+    }
+    return windows;
+}
+
+// Convenience wrapper matching pipeline_pose2vid_long.py's real (non-discarded)
+// context_scheduler(...) call site: step is always 0 there (both call sites in
+// the reference __call__ pass literal 0), and num_steps is unused by uniform()
+// itself, so neither needs to be a parameter here.
+inline std::vector<std::vector<int>> aa_context_windows(int num_frames,
+                                                          int context_frames,
+                                                          int context_stride,
+                                                          int context_overlap,
+                                                          bool closed_loop) {
+    return uniform(/*step=*/0, /*num_steps=*/0, num_frames, context_frames,
+                    context_stride, context_overlap, closed_loop);
+}
+
+}  // namespace animate_anyone_context
 
 struct EDMVDenoiser : public CompVisVDenoiser {
     float min_sigma = 0.002f;

@@ -93,6 +93,12 @@ static void print_usage() {
             "      v-prediction step) against <fixtures>/sched_v2.json (default fixtures\n"
             "      dir: $SDCPP_AA_FIXTURES or /data/sdcpp-pixel-refs/fixtures). Exits 0\n"
             "      only if all three checks pass, 1 otherwise.\n"
+            "  context-schedule [--fixtures <dir>]\n"
+            "      Verifies the Task 10 sliding-window context scheduler\n"
+            "      (animate_anyone_context::aa_context_windows(), ported from context.py's\n"
+            "      uniform()) against <fixtures>/context_windows.json for num_frames in\n"
+            "      {64, 32} at the v2 defaults (24/1/4/closed_loop). Requires an EXACT\n"
+            "      match (order and content). Exits 0 only if both match, 1 otherwise.\n"
             "  ref-bank [--vae <path>] [--reference-net <path>] [--fixtures <dir>] [--threads <n>]\n"
             "      (a) VAE-encodes <fixtures>/ref.png with sd-vae-ft-mse (distribution MEAN,\n"
             "      scaled by 0.18215) and compares against <fixtures>/ref_latents.npy at\n"
@@ -881,6 +887,110 @@ static int run_scheduler_mode(int argc, char** argv) {
     return 0;
 }
 
+// mode `context-schedule`: verifies the Task 10 sliding-window context scheduler
+// (src/runtime/denoiser.hpp animate_anyone_context::aa_context_windows(), ported
+// from moore-animate-anyone src/pipelines/context.py's uniform()) against
+// <fixtures>/context_windows.json, for num_frames in {64, 32} at the v2 defaults
+// (context_frames=24, context_stride=1, context_overlap=4, closed_loop=true,
+// step=0). Requires an EXACT match: same number of windows, same order, same
+// per-window index lists. CPU-only, no model weights.
+static int run_context_schedule_mode(int argc, char** argv) {
+    std::string fixtures_dir;
+    if (const char* env = std::getenv("SDCPP_AA_FIXTURES")) {
+        fixtures_dir = env;
+    } else {
+        fixtures_dir = "/data/sdcpp-pixel-refs/fixtures";
+    }
+
+    for (int i = 0; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--fixtures") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --fixtures requires a value\n");
+                return 1;
+            }
+            fixtures_dir = argv[++i];
+        } else {
+            fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+            return 1;
+        }
+    }
+
+    std::string path = fixtures_dir + "/context_windows.json";
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        fprintf(stderr, "error: failed to open %s\n", path.c_str());
+        return 1;
+    }
+    nlohmann::json fixture;
+    try {
+        file >> fixture;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "error: failed to parse %s: %s\n", path.c_str(), e.what());
+        return 1;
+    }
+
+    const auto& params           = fixture.at("params");
+    const int context_frames     = params.at("context_frames").get<int>();
+    const int context_stride     = params.at("context_stride").get<int>();
+    const int context_overlap    = params.at("context_overlap").get<int>();
+    const bool closed_loop       = params.at("closed_loop").get<bool>();
+    const auto& expected_windows = fixture.at("windows");
+
+    bool all_pass = true;
+    for (int num_frames : {64, 32}) {
+        std::vector<std::vector<int>> got = animate_anyone_context::aa_context_windows(
+            num_frames, context_frames, context_stride, context_overlap, closed_loop);
+
+        const auto& expected = expected_windows.at(std::to_string(num_frames));
+        bool pass             = got.size() == expected.size();
+        if (pass) {
+            for (size_t w = 0; w < got.size(); w++) {
+                const auto& expected_w = expected[w];
+                if (got[w].size() != expected_w.size()) {
+                    pass = false;
+                    break;
+                }
+                for (size_t k = 0; k < got[w].size(); k++) {
+                    if (got[w][k] != expected_w[k].get<int>()) {
+                        pass = false;
+                        break;
+                    }
+                }
+                if (!pass) {
+                    break;
+                }
+            }
+        }
+
+        printf("num_frames=%d: got %zu window(s), expected %zu window(s): %s\n",
+               num_frames, got.size(), expected.size(), pass ? "exact match" : "MISMATCH");
+        if (!pass) {
+            fprintf(stderr, "FAIL: num_frames=%d context window mismatch\n", num_frames);
+            fprintf(stderr, "  got:      ");
+            for (const auto& w : got) {
+                fprintf(stderr, "[");
+                for (int idx : w) fprintf(stderr, "%d,", idx);
+                fprintf(stderr, "] ");
+            }
+            fprintf(stderr, "\n  expected: ");
+            for (const auto& w : expected) {
+                fprintf(stderr, "[");
+                for (const auto& idx : w) fprintf(stderr, "%d,", idx.get<int>());
+                fprintf(stderr, "] ");
+            }
+            fprintf(stderr, "\n");
+        }
+        all_pass = all_pass && pass;
+    }
+
+    if (!all_pass) {
+        return 1;
+    }
+    printf("PASS: AnimateAnyone Task 10 context window scheduler matches reference (F=64, F=32)\n");
+    return 0;
+}
+
 // mode `ref-bank`: ReferenceNet forward with hidden-state bank capture (task 6).
 //
 // (a) VAE mean-path encode: the reference pipeline encodes the ref image with
@@ -1550,6 +1660,8 @@ int main(int argc, char** argv) {
         return run_clip_embeds_mode(argc - 2, argv + 2);
     } else if (mode == "scheduler") {
         return run_scheduler_mode(argc - 2, argv + 2);
+    } else if (mode == "context-schedule") {
+        return run_context_schedule_mode(argc - 2, argv + 2);
     } else if (mode == "ref-bank") {
         return run_ref_bank_mode(argc - 2, argv + 2);
     } else if (mode == "unet-step-f1") {

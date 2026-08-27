@@ -40,8 +40,13 @@ together with `--reference-net`.
   skeleton on black, rendered at the target resolution), consumed in
   lexicographic filename order.
   - img_gen: the first pose image is used (one output image).
-  - vid_gen: one output frame per pose image, currently capped at 24 frames
-    (the reference context window; longer clips need the sliding-window path).
+  - vid_gen: one output frame per pose image. Clips longer than 24 frames run
+    through the reference's sliding-window scheme (moore-animate-anyone's
+    `context.py` `uniform()`, ported faithfully: 24-frame windows, stride 1,
+    4-frame overlap, closed_loop wraparound) - the per-window UNet outputs are
+    scatter-accumulated and averaged before one scheduler step per timestep,
+    exactly as `pipeline_pose2vid_long.py` does. Total frame count is capped
+    at 128 (a sanity ceiling, not a model limit).
 
 Width/height must be multiples of 8. Recommended defaults: 512x512 (or the
 pose image's own aspect, e.g. 512x640), `--steps 25`, `--cfg-scale 3.5`,

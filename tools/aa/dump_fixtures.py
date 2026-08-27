@@ -56,6 +56,79 @@ DTYPE = torch.float32
 manifest = {}
 
 
+def dump_context_windows_only():
+    """--context-windows: dump context_windows.json only, from the reference
+    src.pipelines.context.uniform() (context.py:15), and update just that
+    entry in manifest.json. Does NOT load any model weights - this fixture is
+    pure scheduling math (Task 10), independent of the heavy checkpoints the
+    rest of this script needs.
+
+    Matches exactly how pipeline_pose2vid_long.py's __call__ invokes the
+    context scheduler for its real (non-discarded) context_queue: step=0,
+    num_frames=latents.shape[2], context_frames=24, context_stride=1,
+    context_overlap=4, closed_loop=True (the v2 defaults)."""
+    from src.pipelines.context import uniform  # noqa: E402
+
+    context_frames = 24
+    context_stride = 1
+    context_overlap = 4
+    closed_loop = True
+    step = 0
+    num_steps = 25
+
+    windows = {}
+    for num_frames in (64, 32):
+        windows[str(num_frames)] = list(
+            uniform(
+                step,
+                num_steps,
+                num_frames,
+                context_frames,
+                context_stride,
+                context_overlap,
+                closed_loop,
+            )
+        )
+
+    out = {
+        "params": {
+            "step": step,
+            "context_frames": context_frames,
+            "context_stride": context_stride,
+            "context_overlap": context_overlap,
+            "closed_loop": closed_loop,
+        },
+        "windows": windows,
+    }
+    path = FIXTURES_DIR / "context_windows.json"
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"  wrote {path}")
+    for nf, wins in windows.items():
+        print(f"    num_frames={nf}: {len(wins)} window(s)")
+
+    manifest_path = FIXTURES_DIR / "manifest.json"
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            full_manifest = json.load(f)
+    else:
+        full_manifest = {"other_files": {}}
+    full_manifest.setdefault("other_files", {})["context_windows.json"] = (
+        "context.py uniform() window lists for num_frames in {64,32}, step=0, "
+        "v2 defaults (context_frames=24, context_stride=1, context_overlap=4, "
+        "closed_loop=True)"
+    )
+    with open(manifest_path, "w") as f:
+        json.dump(full_manifest, f, indent=2)
+    print(f"  updated {manifest_path} (context_windows.json entry only)")
+
+
+if "--context-windows" in sys.argv:
+    sys.path.insert(0, str(REF_REPO))
+    dump_context_windows_only()
+    sys.exit(0)
+
+
 def save_npy(name, tensor):
     arr = tensor.detach().to(torch.float32).cpu().numpy()
     path = FIXTURES_DIR / f"{name}.npy"

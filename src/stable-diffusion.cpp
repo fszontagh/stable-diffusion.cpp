@@ -5746,26 +5746,142 @@ static std::vector<float> make_hires_sigma_schedule(sd_ctx_t* sd_ctx,
 
 /*========================= AnimateAnyone generation =========================*/
 
+// The AnimateAnyone motion module's positional encoding is trained for at
+// most 32 frames per forward pass - that is a hard per-window limit
+// (AA_MOTION_MODULE_MAX_WINDOW_FRAMES). Task 10's sliding-window scheme keeps
+// every individual UNet call within it while letting the total requested
+// clip length run much longer, so the only remaining bound on total frame
+// count is a sanity ceiling against an unbounded --pose-dir - not a model
+// limit, just cheap insurance against silently trying to allocate an
+// enormous latent/noise_pred/counter tensor set.
+static constexpr int AA_MOTION_MODULE_MAX_WINDOW_FRAMES = 32;
+static constexpr int AA_MAX_TOTAL_FRAMES                = 128;
+
+// v2 defaults pipeline_pose2vid_long.py's callers pass to the context
+// scheduler (P-map section 5 pose2vid notes): a 24-frame window, stride 1,
+// 4-frame overlap between consecutive windows, closed_loop=true (the last
+// window wraps around to frame 0 rather than stopping short). 24 is well
+// within AA_MOTION_MODULE_MAX_WINDOW_FRAMES's 32-frame ceiling - it is the
+// reference's own choice of window size, not derived from the motion
+// module's hard limit, so it must NOT be confused with (or replaced by)
+// AA_MOTION_MODULE_MAX_WINDOW_FRAMES above.
+static constexpr int AA_CONTEXT_FRAMES  = 24;
+static constexpr int AA_CONTEXT_STRIDE  = 1;
+static constexpr int AA_CONTEXT_OVERLAP = 4;
+
 // Lexicographically sorted list of regular files in `dir` (the documented
 // --pose-dir convention: frames stored as images named in character order).
+// Filters by image extension (.png .jpg .jpeg .bmp .webp, case-insensitive)
+// so a stray non-image file (a .txt README, a .DS_Store, a checksum file)
+// dropped in the pose directory doesn't silently become a "pose frame" and
+// fail image decoding deep inside the generation loop.
+static bool aa_has_image_extension(const std::filesystem::path& path) {
+    static const char* kExts[] = {".png", ".jpg", ".jpeg", ".bmp", ".webp"};
+    std::string ext            = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    for (const char* candidate : kExts) {
+        if (ext == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::vector<std::string> aa_list_pose_files(const char* dir) {
     std::vector<std::string> files;
     if (dir == nullptr || strlen(dir) == 0) {
         return files;
     }
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (entry.is_regular_file()) {
-            files.push_back(entry.path().string());
-        }
-    }
+    // Manual ec-checked increment (rather than the range-for form, which
+    // aborts the whole iteration - not just skips one entry - the moment any
+    // single directory entry's increment fails, e.g. a broken symlink or a
+    // permission-denied entry mixed in with otherwise-good pose frames).
+    auto it = std::filesystem::directory_iterator(dir, ec);
     if (ec) {
         LOG_ERROR("failed to list pose dir '%s': %s", dir, ec.message().c_str());
-        files.clear();
         return files;
+    }
+    std::filesystem::directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            LOG_ERROR("failed to advance directory iterator for pose dir '%s': %s", dir, ec.message().c_str());
+            files.clear();
+            return files;
+        }
+        if (it->is_regular_file() && aa_has_image_extension(it->path())) {
+            files.push_back(it->path().string());
+        }
     }
     std::sort(files.begin(), files.end());
     return files;
+}
+
+// --- Task 10: sliding-window long-video helpers ---
+//
+// sd::Tensor<float> stores dim 0 as the fastest-varying axis (offset_of():
+// stride starts at 1 and multiplies by shape_[i] going up through the axes),
+// so for a [lw, lh, C, F] tensor the frame axis (dim 3) is the slowest: frame
+// f occupies one contiguous block of lw*lh*C elements at [f*block, (f+1)*block).
+// That lets the gather/scatter below work as flat memcpy/accumulate over
+// per-frame blocks instead of going through the generic (single contiguous
+// range) slice()/slice_assign() helpers, which can't express an arbitrary
+// (possibly repeating, possibly wrapped) index list.
+
+// Builds a new [lw, lh, C, idx.size()] tensor by copying the idx[k]-th frame
+// block of `src` (shape [lw, lh, C, F]) into output position k, for each k -
+// the per-window "gather latents/pose slices" step of the context loop.
+// idx entries may repeat or be out of ascending order (context windows wrap).
+static sd::Tensor<float> aa_gather_frames(const sd::Tensor<float>& src, const std::vector<int>& idx) {
+    const auto& shape = src.shape();  // [lw, lh, C, F]
+    int64_t block      = shape[0] * shape[1] * shape[2];
+    std::vector<int64_t> out_shape = {shape[0], shape[1], shape[2], (int64_t)idx.size()};
+    sd::Tensor<float> out(out_shape);
+    for (size_t k = 0; k < idx.size(); ++k) {
+        std::copy_n(src.data() + (int64_t)idx[k] * block, block, out.data() + (int64_t)k * block);
+    }
+    return out;
+}
+
+// Scatter-accumulate: for each k, adds pred's k-th frame block into acc's
+// idx[k]-th frame block and increments counter[idx[k]] - the per-window
+// "noise_pred[:,:,c] += pred; counter[:,:,c] += 1" step of the reference loop
+// (pipeline_pose2vid_long.py __call__). `acc` and `counter` must already be
+// sized/zeroed for the full F-frame clip before the window loop starts.
+static void aa_scatter_add_frames(sd::Tensor<float>* acc,
+                                  std::vector<float>* counter,
+                                  const sd::Tensor<float>& pred,
+                                  const std::vector<int>& idx) {
+    const auto& shape = acc->shape();  // [lw, lh, C, F]
+    int64_t block      = shape[0] * shape[1] * shape[2];
+    for (size_t k = 0; k < idx.size(); ++k) {
+        float* dst       = acc->data() + (int64_t)idx[k] * block;
+        const float* src = pred.data() + (int64_t)k * block;
+        for (int64_t e = 0; e < block; ++e) {
+            dst[e] += src[e];
+        }
+        (*counter)[idx[k]] += 1.0f;
+    }
+}
+
+// Divides each frame block of `acc` by its counter entry in place - the
+// "noise_pred / counter" average, applied once per timestep after every
+// window in the context queue has scatter-added into `acc`.
+static void aa_average_by_counter(sd::Tensor<float>* acc, const std::vector<float>& counter) {
+    const auto& shape = acc->shape();  // [lw, lh, C, F]
+    int64_t block      = shape[0] * shape[1] * shape[2];
+    for (size_t f = 0; f < counter.size(); ++f) {
+        float c = counter[f];
+        if (c <= 0.0f) {
+            continue;  // unreachable with a correct context schedule (every frame is covered
+                       // by at least one window), but avoids a div-by-zero if it ever isn't.
+        }
+        float* p = acc->data() + (int64_t)f * block;
+        for (int64_t e = 0; e < block; ++e) {
+            p[e] /= c;
+        }
+    }
 }
 
 // Loads an image file as an fp32 tensor [W,H,3,1]. scale=true -> [0,1].
@@ -5839,6 +5955,10 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
     if ((int)pose_files.size() > F) {
         LOG_INFO("AnimateAnyone: using the first %d of %zu pose images", F, pose_files.size());
     }
+    if (F > AA_MAX_TOTAL_FRAMES) {
+        LOG_ERROR("AnimateAnyone: %d frames requested, exceeding the %d-frame sanity ceiling", F, AA_MAX_TOTAL_FRAMES);
+        return false;
+    }
 
     const int W  = request.width;
     const int H  = request.height;
@@ -5849,6 +5969,15 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
     if (steps <= 0) {
         steps = 25;
     }
+    // Task 9/10 carried minor: the family recommendation is cfg 3.5, but
+    // sd_sample_params_init() bakes txt_cfg=7.0 as the one global default for
+    // every model family, indistinguishable at this point from a caller who
+    // explicitly asked for 7.0 (there is no "unset" marker for cfg_scale -
+    // contrast sample_steps, which uses <=0 as its marker, or high_noise
+    // sample_steps, which uses -1). Enforcing a family-specific default here
+    // would silently override an explicit --cfg-scale 7 from the caller, so
+    // this is intentionally left alone: 3.5 remains a docs-only
+    // recommendation (see AnimateAnyone usage docs), not a code default.
     const float cfg_scale = request.guidance.txt_cfg;
     const bool do_cfg     = cfg_scale > 1.0f;
     LOG_INFO("AnimateAnyone: %dx%d, %d frame(s), %d steps, cfg %.2f, seed %" PRId64,
@@ -5966,6 +6095,35 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
         ~AARunnerDone() { runner->runner_done(); }
     } diffusion_done{sd->diffusion_model.get()};
 
+    // --- Task 10: sliding-window context schedule. ---
+    // moore-animate-anyone's context.py uniform() scheduler is invoked with
+    // step=0 at both call sites in pipeline_pose2vid_long.py's __call__ (the
+    // first call, with context_overlap forced to 0, only feeds a discarded
+    // num_context_batches count; the real context_queue used below is the
+    // second call, with the caller's context_overlap). step never varies
+    // across denoising steps, so - unlike the reference, which recomputes
+    // context_queue every iteration of its "for i, t in enumerate(timesteps)"
+    // loop for no functional reason (it's the same list every time) - this
+    // port computes the window list once, outside the step loop.
+    //
+    // context_frames=24, context_stride=1, context_overlap=4, closed_loop=true
+    // are the v2 defaults pipeline_pose2vid_long.py's callers use (P-map
+    // section 5 pose2vid notes). When F <= 24 this degenerates to exactly one
+    // window covering every frame in order - the same computation the old
+    // (pre-Task-10) single-window code path did, so the gather/scatter loop
+    // below is correct (if one memcpy layer more expensive) for F<=24 too and
+    // there is no separate "small F" fast path to keep in sync.
+    std::vector<std::vector<int>> context_windows = animate_anyone_context::aa_context_windows(
+        F, AA_CONTEXT_FRAMES, AA_CONTEXT_STRIDE, AA_CONTEXT_OVERLAP, /*closed_loop=*/true);
+    if (context_windows.empty()) {
+        LOG_ERROR("AnimateAnyone: context window schedule is empty for F=%d", F);
+        return false;
+    }
+    if (context_windows.size() > 1) {
+        LOG_INFO("AnimateAnyone: %d frames > %d-frame window, using %zu sliding context window(s)",
+                 F, AA_CONTEXT_FRAMES, context_windows.size());
+    }
+
     int64_t last_step_ms = ggml_time_ms();
     for (int i = 0; i < steps; ++i) {
         if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
@@ -5976,37 +6134,74 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
         std::vector<float> t_vec(1, static_cast<float>(t));
         sd::Tensor<float> timesteps_tensor = sd::Tensor<float>::from_vector(t_vec);
 
-        sd::Tensor<float> v_cond;
-        sd::Tensor<float> v_uncond;
-        for (int h = do_cfg ? 0 : 1; h < 2; ++h) {
-            UNetDiffusionExtra extra;
-            extra.num_video_frames = F;
-            extra.aa_banks         = (h == 0) ? nullptr : &banks;
-            extra.aa_is_uncond     = (h == 0);
-            extra.aa_pose_feature  = &pose_feature;
-            // F=1: skip the motion modules. They were trained on 24-frame
-            // windows and degenerate at a single frame - verified against the
-            // PyTorch reference (task 9): with motion active at F=1 BOTH this
-            // port and the reference pipeline fail to denoise identically
-            // (latent std grows monotonically, output is noise), while the
-            // spatial-only forward denoises normally. Video generation (F>1)
-            // keeps the motion modules.
-            extra.aa_spatial_only = (F == 1);
-
-            DiffusionParams params;
-            params.x         = &x;
-            params.timesteps = &timesteps_tensor;
-            params.context   = (h == 0) ? &clip_uncond : &clip_cond.c_crossattn;
-            params.extra     = extra;
-
-            sd::Tensor<float> out = sd->diffusion_model->compute(sd->n_threads, params);
-            if (out.empty()) {
-                LOG_ERROR("AnimateAnyone %s forward failed at step %d (t=%d)",
-                          h == 0 ? "uncond" : "cond", i + 1, t);
-                return false;
-            }
-            (h == 0 ? v_uncond : v_cond) = std::move(out);
+        // Per-window accumulate/average pattern (pipeline_pose2vid_long.py
+        // __call__): noise_pred and counter start zeroed for the whole F-frame
+        // clip; every window's UNet output is scatter-added into its frame
+        // positions and its counter bumped by 1; after all windows, divide by
+        // counter (average the overlap) and only THEN apply CFG - matching
+        // "noise_pred_uncond, noise_pred_text = (noise_pred / counter).chunk(2)"
+        // followed by the guidance combination, all before the single
+        // scheduler.step() call for every frame in the clip.
+        sd::Tensor<float> acc_cond({lw, lh, 4, F});
+        acc_cond.fill_(0.f);
+        std::vector<float> counter_cond(F, 0.f);
+        sd::Tensor<float> acc_uncond;
+        std::vector<float> counter_uncond;
+        if (do_cfg) {
+            acc_uncond = sd::Tensor<float>({lw, lh, 4, F});
+            acc_uncond.fill_(0.f);
+            counter_uncond.assign(F, 0.f);
         }
+
+        for (const std::vector<int>& window : context_windows) {
+            sd::Tensor<float> x_win           = aa_gather_frames(x, window);
+            sd::Tensor<float> pose_feature_win = aa_gather_frames(pose_feature, window);
+            const int window_size              = (int)window.size();
+
+            for (int h = do_cfg ? 0 : 1; h < 2; ++h) {
+                UNetDiffusionExtra extra;
+                extra.num_video_frames = window_size;
+                extra.aa_banks         = (h == 0) ? nullptr : &banks;
+                extra.aa_is_uncond     = (h == 0);
+                extra.aa_pose_feature  = &pose_feature_win;
+                // A window of exactly 1 frame (whole-clip F==1, plain image
+                // generation - the only way a window can be size 1, since
+                // aa_context_windows()'s F<=context_size branch yields
+                // list(range(F))) skips the motion modules. They were trained
+                // on multi-frame windows and degenerate at a single frame -
+                // verified against the PyTorch reference (task 9): with
+                // motion active at F=1 BOTH this port and the reference
+                // pipeline fail to denoise identically (latent std grows
+                // monotonically, output is noise), while the spatial-only
+                // forward denoises normally.
+                extra.aa_spatial_only = (window_size == 1);
+
+                DiffusionParams params;
+                params.x         = &x_win;
+                params.timesteps = &timesteps_tensor;
+                params.context   = (h == 0) ? &clip_uncond : &clip_cond.c_crossattn;
+                params.extra     = extra;
+
+                sd::Tensor<float> out = sd->diffusion_model->compute(sd->n_threads, params);
+                if (out.empty()) {
+                    LOG_ERROR("AnimateAnyone %s forward failed at step %d (t=%d)",
+                              h == 0 ? "uncond" : "cond", i + 1, t);
+                    return false;
+                }
+                if (h == 0) {
+                    aa_scatter_add_frames(&acc_uncond, &counter_uncond, out, window);
+                } else {
+                    aa_scatter_add_frames(&acc_cond, &counter_cond, out, window);
+                }
+            }
+        }
+
+        aa_average_by_counter(&acc_cond, counter_cond);
+        if (do_cfg) {
+            aa_average_by_counter(&acc_uncond, counter_uncond);
+        }
+        sd::Tensor<float> v_cond   = std::move(acc_cond);
+        sd::Tensor<float> v_uncond = do_cfg ? std::move(acc_uncond) : sd::Tensor<float>{};
 
         sd::Tensor<float> v_pred = do_cfg
                                        ? v_uncond + (v_cond - v_uncond) * cfg_scale
@@ -7286,22 +7481,30 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
     int n_frames = sd_vid_gen_params->video_frames;
     if (sd_version_is_animate_anyone(sd_ctx->sd->version)) {
         // AnimateAnyone vid_gen: F is the number of pose frames in --pose-dir
-        // (one generated frame per pose image), capped at 24 - the reference
-        // context window (context_frames=24); the sliding-window path for
-        // longer clips is task 10.
+        // (one generated frame per pose image). Task 10 lifts the old 24-frame
+        // cap: generate_animate_anyone() now runs the reference's sliding
+        // context-window scheme (context_frames=24) once F exceeds one
+        // window, so the total clip length isn't bounded by the motion
+        // module's single-window training length any more. It IS still
+        // bounded by AA_MAX_TOTAL_FRAMES (a sane ceiling, not a model limit)
+        // to keep a runaway --pose-dir from silently trying to allocate an
+        // enormous latent/noise_pred/counter tensor set.
         std::vector<std::string> pose_files = aa_list_pose_files(sd_vid_gen_params->pose_images_dir);
         if (pose_files.empty()) {
             LOG_ERROR("AnimateAnyone vid_gen requires --pose-dir with at least one pose image");
             return false;
         }
         n_frames = (int)pose_files.size();
-        if (n_frames > 24) {
-            LOG_WARN("AnimateAnyone is currently capped at 24 frames (reference context window; "
-                     "longer clips need the sliding-window path); using the first 24 of %zu pose images",
-                     pose_files.size());
-            n_frames = 24;
+        if (n_frames > AA_MAX_TOTAL_FRAMES) {
+            LOG_WARN("AnimateAnyone: %zu pose images found, capping to %d frames (sanity ceiling)",
+                     pose_files.size(), AA_MAX_TOTAL_FRAMES);
+            n_frames = AA_MAX_TOTAL_FRAMES;
         }
-        if (sd_vid_gen_params->video_frames > 1 && sd_vid_gen_params->video_frames != n_frames) {
+        // Warn on any mismatch, not just video_frames > 1 - the previous
+        // condition silently dropped the warning when video_frames was
+        // explicitly set to 1, which is exactly as much a mismatch as any
+        // other value once n_frames follows --pose-dir instead.
+        if (sd_vid_gen_params->video_frames != n_frames) {
             LOG_WARN("AnimateAnyone ignores --video-frames (%d); frame count follows --pose-dir (%d)",
                      sd_vid_gen_params->video_frames, n_frames);
         }
@@ -7309,7 +7512,13 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
         LOG_ERROR("AnimateDiff: --video-frames must be >= 1");
         return false;
     }
-    if (n_frames > 32) {
+    // Plain AnimateDiff (non-AA) has no sliding-window path, so its 32-frame
+    // positional-encoding context is a hard ceiling on the whole clip.
+    // AnimateAnyone's own motion module has the same 32-frame per-window
+    // limit, but generate_animate_anyone()'s Task 10 window loop keeps every
+    // per-window UNet call within it while letting the total clip run past
+    // 32 (up to AA_MAX_TOTAL_FRAMES, capped just above).
+    if (!sd_version_is_animate_anyone(sd_ctx->sd->version) && n_frames > 32) {
         LOG_WARN("AnimateDiff motion modules have a 32-frame positional-encoding context; capping to 32");
         n_frames = 32;
     }
