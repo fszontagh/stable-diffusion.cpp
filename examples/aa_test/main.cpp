@@ -11,8 +11,16 @@
 
 #include "model.h"
 #include "model_loader.h"
+#include "stable-diffusion.h"
 
 extern const char* model_version_to_str[];
+
+// Route the library's LOG_* calls (including get_sd_version()'s fallback-detection
+// LOG_WARN) to stderr. Without a registered callback, log_printf() is a silent no-op,
+// which would hide detection warnings from this diagnostic tool's own output.
+static void aa_test_log_cb(enum sd_log_level_t level, const char* text, void* /*data*/) {
+    fputs(text, stderr);
+}
 
 static void print_usage() {
     fprintf(stderr,
@@ -67,11 +75,13 @@ static int run_version_mode(int argc, char** argv) {
     }
     printf("detected version: %s\n", model_version_to_str[version]);
 
-    // Manual promotion rule mirroring new_sd_ctx()'s init() flow: a
-    // SD1-signature diffusion model plus a non-empty reference_net_path
-    // promotes to VERSION_ANIMATE_ANYONE.
-    if (sd_version_is_sd1(version) && !sd_version_is_animate_anyone(version) && !reference_net_path.empty()) {
-        version = VERSION_ANIMATE_ANYONE;
+    // Shared promotion rule (src/model.h) also used by new_sd_ctx()'s init() flow: a
+    // SD1-signature diffusion model plus a non-empty reference_net_path promotes to
+    // VERSION_ANIMATE_ANYONE.
+    SDVersion promoted = sd_apply_animate_anyone_promotion(version,
+                                                            reference_net_path.empty() ? nullptr : reference_net_path.c_str());
+    if (promoted != version) {
+        version = promoted;
         printf("reference_net_path set, promoting detected version to %s\n", model_version_to_str[version]);
     }
 
@@ -80,6 +90,8 @@ static int run_version_mode(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    sd_set_log_callback(aa_test_log_cb, nullptr);
+
     if (argc < 2) {
         print_usage();
         return 1;

@@ -909,10 +909,16 @@ public:
             LOG_INFO("Version: %s ", model_version_to_str[version]);
         }
 
-        if (sd_version_is_sd1(version) && !sd_version_is_animate_anyone(version) &&
-            sd_ctx_params->reference_net_path != nullptr && strlen(sd_ctx_params->reference_net_path) > 0) {
-            version = VERSION_ANIMATE_ANYONE;
-            LOG_INFO("reference_net_path set, promoting detected version to %s", model_version_to_str[version]);
+        {
+            // !sd_version_is_animate_anyone(version) here is future-proofing: no detection path
+            // in get_sd_version() returns VERSION_ANIMATE_ANYONE today (it can't see
+            // reference_net_path), so this is always true at this point, but the helper checks
+            // it defensively in case that ever changes.
+            SDVersion promoted = sd_apply_animate_anyone_promotion(version, sd_ctx_params->reference_net_path);
+            if (promoted != version) {
+                version = promoted;
+                LOG_INFO("reference_net_path set, promoting detected version to %s", model_version_to_str[version]);
+            }
         }
 
         if (auto_fit_enabled) {

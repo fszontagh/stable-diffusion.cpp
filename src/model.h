@@ -74,6 +74,20 @@ static inline bool sd_version_is_sd1(SDVersion version) {
     return false;
 }
 
+// Shared AnimateAnyone version-promotion rule: get_sd_version() cannot see
+// reference_net_path (it only inspects the diffusion model's own tensors), so a
+// SD1-signature diffusion model plus a non-empty --reference-net is promoted to
+// VERSION_ANIMATE_ANYONE here, after detection, at the sd_ctx_t/tooling level.
+// Used by both new_sd_ctx() (stable-diffusion.cpp) and sd-aa-test so the two
+// stay in lockstep.
+static inline SDVersion sd_apply_animate_anyone_promotion(SDVersion version, const char* reference_net_path) {
+    if (sd_version_is_sd1(version) && !sd_version_is_animate_anyone(version) &&
+        reference_net_path != nullptr && reference_net_path[0] != '\0') {
+        return VERSION_ANIMATE_ANYONE;
+    }
+    return version;
+}
+
 static inline bool sd_version_is_sd2(SDVersion version) {
     if (version == VERSION_SD2 || version == VERSION_SD2_INPAINT || version == VERSION_SD2_TINY_UNET || version == VERSION_SDXS_09) {
         return true;

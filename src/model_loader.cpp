@@ -464,6 +464,8 @@ SDVersion ModelLoader::get_sd_version() {
     bool has_output_block_311        = false;
     bool has_output_block_71         = false;
     bool has_attn_1024               = false;
+    bool has_diffusers_down_blocks   = false;
+    int64_t cross_attn_context_dim   = 0;
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
         if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos ||
@@ -564,6 +566,18 @@ SDVersion ModelLoader::get_sd_version() {
                 is_xl = true;
             }
         }
+        if (tensor_storage.name.find("model.diffusion_model.down_blocks.") != std::string::npos) {
+            has_diffusers_down_blocks = true;
+            // Cross-attention (attn2) `to_k` input width is the text-encoder context dim, which
+            // is the same for every cross-attention layer in a diffusers UNet: 768 for SD1 (CLIP
+            // ViT-L), 1024 for SD2 (OpenCLIP), and much larger for SDXL (concatenated encoders).
+            // Used below to positively identify SD1 when no CLIP tensors are present at all
+            // (a standalone diffusion-model-only load), instead of defaulting to SD1 on any UNet.
+            if (cross_attn_context_dim == 0 &&
+                ends_with(tensor_storage.name, "attn2.to_k.weight")) {
+                cross_attn_context_dim = tensor_storage.ne[0];
+            }
+        }
         if (tensor_storage.name.find("conditioner.embedders.1") != std::string::npos ||
             tensor_storage.name.find("cond_stage_model.1") != std::string::npos ||
             tensor_storage.name.find("te.1") != std::string::npos) {
@@ -576,17 +590,23 @@ SDVersion ModelLoader::get_sd_version() {
             return VERSION_SVD;
         }
         if (tensor_storage.name.find("model.diffusion_model.middle_block.1.") != std::string::npos ||
-            tensor_storage.name.find("unet.mid_block.resnets.1.") != std::string::npos) {
+            tensor_storage.name.find("unet.mid_block.resnets.1.") != std::string::npos ||
+            // diffusers-format standalone UNet loaded under "model.diffusion_model." (see
+            // has_diffusers_down_blocks above) keeps "mid_block.resnets.1." naming.
+            tensor_storage.name.find("model.diffusion_model.mid_block.resnets.1.") != std::string::npos) {
             has_middle_block_1 = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.output_blocks.3.1.transformer_blocks.1") != std::string::npos ||
-            tensor_storage.name.find("unet.up_blocks.1.attentions.0.transformer_blocks.1") != std::string::npos) {
+            tensor_storage.name.find("unet.up_blocks.1.attentions.0.transformer_blocks.1") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.up_blocks.1.attentions.0.transformer_blocks.1") != std::string::npos) {
             has_output_block_311 = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1") != std::string::npos ||
-            tensor_storage.name.find("unet.up_blocks.2.attentions.1") != std::string::npos) {
+            tensor_storage.name.find("unet.up_blocks.2.attentions.1") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.up_blocks.2.attentions.1") != std::string::npos) {
             has_output_block_71 = true;
-            if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_k.weight") != std::string::npos) {
+            if (tensor_storage.name.find("model.diffusion_model.output_blocks.7.1.transformer_blocks.0.attn1.to_k.weight") != std::string::npos ||
+                tensor_storage.name.find("model.diffusion_model.up_blocks.2.attentions.1.transformer_blocks.0.attn1.to_k.weight") != std::string::npos) {
                 if (tensor_storage.ne[0] == 1024)
                     has_attn_1024 = true;
             }
@@ -602,7 +622,8 @@ SDVersion ModelLoader::get_sd_version() {
         }
         if (tensor_storage.name == "model.diffusion_model.input_blocks.0.0.weight" ||
             tensor_storage.name == "model.diffusion_model.img_in.weight" ||
-            tensor_storage.name == "unet.conv_in.weight") {
+            tensor_storage.name == "unet.conv_in.weight" ||
+            tensor_storage.name == "model.diffusion_model.conv_in.weight") {
             input_block_weight = tensor_storage;
         }
         if (tensor_storage.name == "model.diffusion_model.txt_in.weight" || tensor_storage.name == "model.diffusion_model.context_embedder.weight") {
@@ -684,11 +705,38 @@ SDVersion ModelLoader::get_sd_version() {
         }
         return VERSION_SD2;
     }
-    if (is_unet && !is_xl) {
+    if (has_diffusers_down_blocks && !is_xl && cross_attn_context_dim == 768) {
         // No CLIP text encoder tensors were found alongside the UNet (e.g. a standalone
         // diffusion-model-only load such as AnimateAnyone's denoising_unet.pth/reference_unet.pth).
-        // Default to the SD1 UNet family, its natural signature absent a distinguishing encoder.
-        return VERSION_SD1;
+        // Positively corroborated as SD1 (not just "some UNet") by the cross-attention context
+        // width being 768 (CLIP ViT-L, matches SD1; SD2 is 1024, SDXL is larger) - do NOT fall
+        // back to SD1 on is_unet alone, that would also misdetect standalone SD2/SDXL/inpaint
+        // UNet-only loads whose is_xl marker can't fire without CLIP tensors either.
+        std::string probed_file = file_paths_.empty() ? "<unknown>" : file_paths_.back();
+        SDVersion inferred;
+        const char* inferred_name;
+        if (is_inpaint) {
+            inferred      = VERSION_SD1_INPAINT;
+            inferred_name = "SD 1.x Inpaint";
+        } else if (is_ip2p) {
+            inferred      = VERSION_SD1_PIX2PIX;
+            inferred_name = "Instruct-Pix2Pix";
+        } else if (!has_middle_block_1) {
+            if (!has_output_block_71) {
+                inferred      = VERSION_SDXS_512_DS;
+                inferred_name = "SDXS (512-DS)";
+            } else {
+                inferred      = VERSION_SD1_TINY_UNET;
+                inferred_name = "SD 1.x Tiny UNet";
+            }
+        } else {
+            inferred      = VERSION_SD1;
+            inferred_name = "SD 1.x";
+        }
+        LOG_WARN("get_sd_version: no CLIP text encoder found alongside diffusers-format UNet '%s'; "
+                 "inferring %s from cross-attention context dim %" PRId64,
+                 probed_file.c_str(), inferred_name, cross_attn_context_dim);
+        return inferred;
     }
     return VERSION_COUNT;
 }
