@@ -562,9 +562,17 @@ struct FrozenCLIPVisionEmbedder : public GGMLRunner {
     CLIPVisionModelProjection vision_model;
     std::string weight_prefix = "cond_stage_model.transformer";
 
+    // clip_version/force_quick_gelu default to the historical hard-coded
+    // OpenCLIP ViT-H configuration, so every existing caller is unchanged.
+    // AnimateAnyone passes OPENAI_CLIP_VIT_L_14 + force_quick_gelu=true for
+    // the sd-image-variations encoder (ViT-L arch, quick_gelu, 768-d
+    // projection), whose hidden size the d_model heuristic in clip.hpp would
+    // otherwise mis-detect.
     FrozenCLIPVisionEmbedder(ggml_backend_t backend,
                              const String2TensorStorage& tensor_storage_map      = {},
-                             std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                             std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                             CLIPVersion clip_version                            = OPEN_CLIP_VIT_H_14,
+                             bool force_quick_gelu                               = false)
         : GGMLRunner(backend, weight_manager) {
         bool proj_in = false;
         for (const auto& [name, tensor_storage] : tensor_storage_map) {
@@ -576,7 +584,7 @@ struct FrozenCLIPVisionEmbedder : public GGMLRunner {
                 break;
             }
         }
-        vision_model = CLIPVisionModelProjection(OPEN_CLIP_VIT_H_14, false, proj_in);
+        vision_model = CLIPVisionModelProjection(clip_version, false, proj_in, force_quick_gelu);
         vision_model.init(params_ctx, tensor_storage_map, weight_prefix);
     }
 
@@ -609,6 +617,68 @@ struct FrozenCLIPVisionEmbedder : public GGMLRunner {
             return build_graph(pixel_values, return_pooled, clip_skip);
         };
         return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, true, true, true));
+    }
+};
+
+// AnimateAnyone conditioner: the "prompt" is a CLIP-vision image embedding,
+// not text (P-map section 5 step 3). The sd-image-variations
+// CLIPVisionModelWithProjection encodes the 224x224 reference image to a
+// single projected token [768] -> context [768, 1, 1]; the unconditional
+// embedding is a literal zero vector of the same shape (torch.zeros_like, NOT
+// an empty-prompt text embedding). Weights arrive under
+// "cond_stage_model.transformer." via the --clip_vision prefix remap.
+struct AnimateAnyoneVisionConditioner : public Conditioner {
+    std::shared_ptr<FrozenCLIPVisionEmbedder> vision;
+
+    AnimateAnyoneVisionConditioner(ggml_backend_t backend,
+                                   const String2TensorStorage& tensor_storage_map      = {},
+                                   std::shared_ptr<RunnerWeightManager> weight_manager = nullptr) {
+        vision = std::make_shared<FrozenCLIPVisionEmbedder>(backend,
+                                                            tensor_storage_map,
+                                                            weight_manager,
+                                                            OPENAI_CLIP_VIT_L_14,
+                                                            /*force_quick_gelu=*/true);
+    }
+
+    SDCondition get_learned_condition(int n_threads,
+                                      const ConditionerParams& conditioner_params) override {
+        SDCondition cond;
+        const int64_t projection_dim = 768;
+        if (conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
+            // Cond half: encode the reference image. clip_preprocess resizes
+            // and normalizes with CLIP's mean/std; the reference pipeline's
+            // exact PIL-bicubic resample is validated separately by aa_test
+            // (task 4) - full generation wiring/preprocessing exactness is
+            // task 9's concern.
+            sd::Tensor<float> pixel_values = clip_preprocess(conditioner_params.ref_images->front(), 224, 224);
+            sd::Tensor<float> embed        = vision->compute(n_threads, pixel_values, /*return_pooled=*/true, /*clip_skip=*/-1);
+            if (embed.empty()) {
+                LOG_ERROR("AnimateAnyone CLIP-vision encode failed");
+                return cond;
+            }
+            cond.c_crossattn = embed.reshape({projection_dim, 1, 1});
+        } else {
+            // Uncond half: literal zeros (P-map section 5 step 3).
+            cond.c_crossattn = sd::Tensor<float>({projection_dim, 1, 1});
+            cond.c_crossattn.fill_(0.f);
+        }
+        return cond;
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
+        vision->get_param_tensors(tensors);
+    }
+
+    void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        vision->set_max_graph_vram_bytes(max_vram_bytes);
+    }
+
+    void set_flash_attention_enabled(bool enabled) override {
+        vision->set_flash_attention_enabled(enabled);
+    }
+
+    void runner_done() override {
+        vision->runner_done();
     }
 };
 

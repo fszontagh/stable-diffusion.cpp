@@ -400,10 +400,11 @@ protected:
     bool ff_in;
 
 public:
-    // AnimateAnyone ReferenceNet bank index, assigned in stable DFS
-    // construction order by UnetModelBlock (16 blocks for SD1.5). -1 (the
-    // default) means "not part of a bank-capable UNet": the capture branch in
-    // forward() is then unreachable, so every existing family is unaffected.
+    // AnimateAnyone bank index, assigned in stable DFS construction order by
+    // UnetModelBlock (16 blocks for SD1.5). -1 (the default) means "not part
+    // of a bank-capable UNet": both the capture branch and the read/injection
+    // branch in forward() are then unreachable, so every existing family is
+    // unaffected.
     int aa_bank_index = -1;
 
     BasicTransformerBlock(int64_t dim,
@@ -457,21 +458,33 @@ public:
 
         auto r = x;
         x      = norm1->forward(ctx, x);
-        if (ctx->aa_bank_capture != nullptr && aa_bank_index >= 0) {
+        if (ctx->aa_bank_capture_enabled && aa_bank_index >= 0) {
             // AnimateAnyone write mode (P-map section 2): bank the post-norm1,
             // PRE-attention hidden states. ggml_cont produces a standalone copy
             // so ggml_set_output can pin it without touching the layer's own
             // dataflow; the copy is persisted via the runner cache under a
-            // stable name and also recorded on the capture handle.
+            // stable name and read back to host after the compute.
             ggml_tensor* banked = ggml_cont(ctx->ggml_ctx, x);
             ggml_set_output(banked);
             ctx->persist_cache_tensor("aa.bank." + std::to_string(aa_bank_index), banked);
-            if ((int)ctx->aa_bank_capture->tensors.size() <= aa_bank_index) {
-                ctx->aa_bank_capture->tensors.resize(aa_bank_index + 1, nullptr);
-            }
-            ctx->aa_bank_capture->tensors[aa_bank_index] = banked;
         }
-        x      = attn1->forward(ctx, x, x);  // self-attention
+        // AnimateAnyone read mode (P-map section 2): for the COND half of the
+        // CFG batch, attn1 becomes concat-KV attention - Q from the current
+        // hidden states only, K/V from concat([x, bank], seq dim), so the
+        // reference tokens are re-projected through this block's own to_k/to_v
+        // (weight-free: attn1 has context_dim == dim) and the key/value
+        // sequence length doubles. The UNCOND half never gets a read handle
+        // (the runner performs separate forwards per CFG half and only arms
+        // aa_bank_read on the cond one), so it runs plain self-attention.
+        // Inert for every existing family: aa_bank_read defaults to nullptr
+        // and aa_bank_index to -1.
+        ggml_tensor* attn1_context = x;
+        if (ctx->aa_bank_read != nullptr && aa_bank_index >= 0 &&
+            aa_bank_index < (int)ctx->aa_bank_read->size() &&
+            (*ctx->aa_bank_read)[aa_bank_index] != nullptr) {
+            attn1_context = ggml_concat(ctx->ggml_ctx, x, (*ctx->aa_bank_read)[aa_bank_index], 1);
+        }
+        x      = attn1->forward(ctx, x, attn1_context);  // self-attention (+optional reference tokens)
         x      = ggml_add(ctx->ggml_ctx, x, r);
         r      = x;
         x      = norm2->forward(ctx, x);
@@ -548,7 +561,8 @@ public:
     // Assigns AnimateAnyone bank indices to this transformer's
     // BasicTransformerBlocks in depth order, advancing the caller's DFS
     // counter. Only UnetModelBlock's construction path calls this; the indices
-    // are inert unless GGMLRunnerContext::aa_bank_capture is set at graph build.
+    // are inert unless GGMLRunnerContext::aa_bank_capture_enabled or
+    // ::aa_bank_read is set at graph build.
     void assign_aa_bank_indices(int& dfs_counter) {
         for (int i = 0; i < depth; i++) {
             auto block = std::dynamic_pointer_cast<BasicTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);

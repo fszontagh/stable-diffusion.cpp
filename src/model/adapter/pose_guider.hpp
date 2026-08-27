@@ -68,6 +68,50 @@ struct PoseGuiderA : public GGMLBlock {
     }
 };
 
+// GGMLRunner wrapper around PoseGuiderA, modeled on
+// LTXVUpsampler::LatentUpsamplerRunner (ltx_latent_upscaler.hpp:431).
+// Originally lived in examples/aa_test; promoted here so stable-diffusion.cpp
+// can construct it for VERSION_ANIMATE_ANYONE (pose_guider.pth loads under the
+// "pose_guider." prefix, whose keys match PoseGuiderA's block dict verbatim).
+struct PoseGuiderRunner : public GGMLRunner {
+    PoseGuiderA model;
+    std::string prefix;
+
+    PoseGuiderRunner(ggml_backend_t backend,
+                     const String2TensorStorage& tensor_storage_map,
+                     const std::string& prefix                           = "",
+                     std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : GGMLRunner(backend, weight_manager), prefix(prefix) {
+        model.init(params_ctx, tensor_storage_map, prefix);
+    }
+
+    std::string get_desc() override {
+        return "pose_guider";
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
+        model.get_param_tensors(tensors, prefix);
+    }
+
+    ggml_cgraph* build_graph(const sd::Tensor<float>& pose_tensor) {
+        ggml_cgraph* gf  = new_graph_custom(4096);
+        ggml_tensor* x   = make_input(pose_tensor);
+        auto runner_ctx  = get_context();
+        ggml_tensor* out = model.forward(&runner_ctx, x);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    sd::Tensor<float> compute(int n_threads, const sd::Tensor<float>& pose_tensor) {
+        auto get_graph = [&]() -> ggml_cgraph* { return build_graph(pose_tensor); };
+        // GGMLRunner::compute() drops trailing singleton dims (ggml_n_dims
+        // ignores them), so a batch-1 [W,H,C,N=1] result comes back as a 3D
+        // [W,H,C] tensor unless restored - matches the LatentUpsamplerRunner
+        // precedent (ltx_latent_upscaler.hpp:502).
+        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), 4);
+    }
+};
+
 }  // namespace AnimateAnyone
 
 #endif  // __SD_MODEL_ADAPTER_POSE_GUIDER_HPP__

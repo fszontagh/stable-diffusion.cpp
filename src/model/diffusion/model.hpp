@@ -48,6 +48,17 @@ struct UNetDiffusionExtra {
     float control_strength                         = 0.f;
     const sd::Tensor<float>* ip_context            = nullptr;
     float ip_scale                                 = 1.f;
+    // AnimateAnyone (all default-off, inert for every other family):
+    // aa_banks = the 16 CFG-doubled reference banks (ggml [C, L, 2], bank
+    // order). The runner performs SEPARATE forwards for the uncond and cond
+    // CFG halves; aa_is_uncond marks which half this forward is. Only the
+    // cond half injects the banks (row 1) into attn1 as concat-KV context;
+    // the uncond half runs plain self-attention (bank row 0 is never read).
+    // aa_pose_feature = PoseGuider output [W/8, H/8, 320, N], added to the
+    // conv_in output before the first down block.
+    const std::vector<sd::Tensor<float>>* aa_banks = nullptr;
+    bool aa_is_uncond                              = false;
+    const sd::Tensor<float>* aa_pose_feature       = nullptr;
 };
 
 struct SkipLayerDiffusionExtra {

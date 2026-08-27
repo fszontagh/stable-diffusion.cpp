@@ -508,6 +508,13 @@ public:
         if (this->config.enable_animatediff) {
             AnimateDiff::MotionModuleConfig mm_cfg;
             mm_cfg.enable_mid_block = this->config.animatediff_has_mid_block;
+            if (version == VERSION_ANIMATE_ANYONE) {
+                // Reference temporal GroupNorm eps is 1e-6
+                // (motion_module.py TemporalTransformer3DModel); required to
+                // stay within the AnimateAnyone fixture tolerance. Other
+                // families keep the fork's historical default.
+                mm_cfg.norm_eps = 1e-6f;
+            }
             blocks["motion_module"] = std::make_shared<AnimateDiff::AnimateDiffModel>(mm_cfg);
         }
     }
@@ -552,7 +559,8 @@ public:
                          ggml_tensor* y                     = nullptr,
                          int num_video_frames               = -1,
                          std::vector<ggml_tensor*> controls = {},
-                         float control_strength             = 0.f) {
+                         float control_strength             = 0.f,
+                         ggml_tensor* pose_feature          = nullptr) {
         // x: [N, in_channels, h, w] or [N, in_channels/2, h, w]
         // timesteps: [N,]
         // context: [N, max_position, hidden_size] or [1, max_position, hidden_size]. for example, [N, 77, 768]
@@ -622,12 +630,28 @@ public:
 
         // input block 0
         auto h = input_blocks_0_0->forward(ctx, x);
+        if (pose_feature != nullptr) {
+            // AnimateAnyone pose conditioning (P-map section 3): the PoseGuider
+            // output is added to the conv_in output before the first down
+            // block, and the sum feeds both the skip connection stack and the
+            // first residual block (unet_3d.py:503-505 adds before
+            // down_block_res_samples is seeded). nullptr for every existing
+            // family - only the AnimateAnyone runner passes a pose feature.
+            h = ggml_add(ctx->ggml_ctx, h, pose_feature);
+        }
         sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks.0", "h");
 
         ggml_set_name(h, "bench-start");
         hs.push_back(h);
 
-        auto motion_root        = config.enable_animatediff && num_video_frames > 1
+        // AnimateAnyone runs its motion modules even at F=1: the reference
+        // 3D UNet applies them unconditionally (temporal self-attention over a
+        // single frame is not a no-op - softmax over one token returns its
+        // value, which still passes through to_out/proj_out and the FF), and
+        // the single-frame fixture was generated with them active. AnimateDiff
+        // keeps its existing F>1 gate.
+        auto motion_root        = config.enable_animatediff &&
+                                          (num_video_frames > 1 || config.version == VERSION_ANIMATE_ANYONE)
                                       ? std::dynamic_pointer_cast<AnimateDiff::AnimateDiffModel>(blocks["motion_module"])
                                       : nullptr;
         auto apply_motion_input = [&](int input_block_idx, ggml_tensor* h_in) -> ggml_tensor* {
@@ -702,9 +726,19 @@ public:
             h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
             if (version != VERSION_SDXL_SSD1B && version != VERSION_SDXL_VEGA) {
                 h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
+                if (version == VERSION_ANIMATE_ANYONE) {
+                    // Reference mid-block order is attn -> motion -> resnet
+                    // (UNetMidBlock3DCrossAttn, P-map section 4), unlike the
+                    // down/up blocks where motion comes after the resnet.
+                    // AnimateDiff keeps the fork's existing after-the-block
+                    // placement below.
+                    h = apply_motion_mid(h);
+                }
                 h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
             }
-            h = apply_motion_mid(h);
+            if (version != VERSION_ANIMATE_ANYONE) {
+                h = apply_motion_mid(h);
+            }
         }
         sd::ggml_graph_cut::mark_graph_cut(h, "unet.middle_block", "h");
         if (controls.size() > 0) {
@@ -782,26 +816,37 @@ struct UNetModelRunner : public DiffusionModelRunner {
 
     // AnimateAnyone ReferenceNet bank capture state. aa_capture_banks is only
     // ever set inside compute_reference_banks(); every normal compute() path
-    // leaves it false, so the capture context member stays nullptr and the
-    // graph is byte-identical to before.
+    // leaves it false, so the capture context flag stays off and the graph is
+    // byte-identical to before.
     bool aa_capture_banks = false;
-    AABankCapture aa_bank_capture_state;
+
+    // AnimateAnyone read-side state, valid only while a compute armed via
+    // aa_banks is in flight. aa_bank_slice_storage owns the host cond-row
+    // slices (make_input keeps raw pointers into them until the graph's input
+    // data is copied); aa_bank_read_inputs is the per-block optional-input
+    // table handed to GGMLRunnerContext::aa_bank_read, indexed by the blocks'
+    // DFS capture index.
+    std::vector<sd::Tensor<float>> aa_bank_slice_storage;
+    std::vector<ggml_tensor*> aa_bank_read_inputs;
 
     UNetModelRunner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map,
                     const std::string prefix,
                     SDVersion version                                   = VERSION_SD1,
                     std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
-                    bool reference_headless                             = false)
+                    bool reference_headless                             = false,
+                    bool force_conv_f32                                 = false)
         : DiffusionModelRunner(backend, prefix, weight_manager),
           config(UNetConfig::detect_from_weights(tensor_storage_map, prefix, version, reference_headless)),
           unet(config) {
-        if (config.reference_headless) {
-            // ReferenceNet precision: reference_unet.pth is fp32 and the bank
-            // fixtures require rel L2 <= 1e-3 per bank; with the default F16
-            // conv kernels the accumulated conv error alone exceeds that
-            // (measured worst bank 1.5e-3). Force F32 conv kernels for this
-            // runner only - normal generation runners are untouched.
+        if (config.reference_headless || force_conv_f32) {
+            // AnimateAnyone precision: the .pth checkpoints are fp32 and the
+            // fixtures require rel L2 <= 1e-3; with the default F16 conv
+            // kernels the accumulated conv error alone exceeds that (task 6:
+            // worst reference bank 1.5e-3). Force F32 conv kernels for the
+            // headless ReferenceNet and for runners that explicitly opt in
+            // (the AnimateAnyone denoising UNet) - normal generation runners
+            // are untouched.
             std::vector<GGMLBlock*> all_blocks;
             unet.get_all_blocks(all_blocks);
             for (GGMLBlock* block : all_blocks) {
@@ -834,15 +879,19 @@ struct UNetModelRunner : public DiffusionModelRunner {
                              const std::vector<sd::Tensor<float>>& controls_tensor = {},
                              float control_strength                                = 0.f,
                              const sd::Tensor<float>& ip_context_tensor            = {},
-                             float ip_scale                                        = 1.f) {
+                             float ip_scale                                        = 1.f,
+                             const std::vector<sd::Tensor<float>>* aa_banks        = nullptr,
+                             bool aa_is_uncond                                     = false,
+                             const sd::Tensor<float>& aa_pose_feature              = {}) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
 
-        ggml_tensor* x          = make_input(x_tensor);
-        ggml_tensor* timesteps  = make_input(timesteps_tensor);
-        ggml_tensor* context    = make_optional_input(context_tensor);
-        ggml_tensor* c_concat   = make_optional_input(c_concat_tensor);
-        ggml_tensor* y          = make_optional_input(y_tensor);
-        ggml_tensor* ip_context = make_optional_input(ip_context_tensor);
+        ggml_tensor* x            = make_input(x_tensor);
+        ggml_tensor* timesteps    = make_input(timesteps_tensor);
+        ggml_tensor* context      = make_optional_input(context_tensor);
+        ggml_tensor* c_concat     = make_optional_input(c_concat_tensor);
+        ggml_tensor* y            = make_optional_input(y_tensor);
+        ggml_tensor* ip_context   = make_optional_input(ip_context_tensor);
+        ggml_tensor* pose_feature = make_optional_input(aa_pose_feature);
         std::vector<ggml_tensor*> controls;
         controls.reserve(controls_tensor.size());
         for (const auto& control_tensor : controls_tensor) {
@@ -857,8 +906,36 @@ struct UNetModelRunner : public DiffusionModelRunner {
         runner_ctx.ip_context = ip_context;
         runner_ctx.ip_scale   = ip_scale;
         if (aa_capture_banks) {
-            aa_bank_capture_state.tensors.clear();
-            runner_ctx.aa_bank_capture = &aa_bank_capture_state;
+            runner_ctx.aa_bank_capture_enabled = true;
+        }
+        // AnimateAnyone read mode: banks are the CFG-doubled ggml [C, L, 2]
+        // host tensors in BANK order (row 0 = uncond, row 1 = cond). Per the
+        // P-map CFG-handling paragraph, only the COND half of the CFG batch
+        // sees the reference (bank row 1); the uncond half is recomputed with
+        // plain self-attention and NO reference at all, so bank row 0 is never
+        // read. The runner performs separate forwards per CFG half, so a
+        // graph either injects everywhere (cond) or nowhere (uncond) - no
+        // runtime row-splitting is ever needed.
+        aa_bank_read_inputs.clear();
+        if (aa_banks != nullptr && !aa_is_uncond) {
+            const size_t n_banks = aa_banks->size();
+            aa_bank_slice_storage.resize(n_banks);
+            aa_bank_read_inputs.assign(n_banks, nullptr);
+            const int* order = aa_bank_capture_order();
+            for (size_t b = 0; b < n_banks; b++) {
+                const auto& bank = (*aa_banks)[b];
+                if (bank.dim() != 3 || bank.shape()[2] != 2) {
+                    LOG_ERROR("aa bank %zu is not a CFG-doubled [C, L, 2] tensor", b);
+                    continue;
+                }
+                // Cond half = row 1 -> [C, L, 1] optional graph input, placed
+                // at this bank's DFS capture index (banks arrive in sorted
+                // bank order; blocks are indexed in capture order).
+                aa_bank_slice_storage[b] = sd::ops::slice(bank, 2, 1, 2);
+                int capture_idx          = (b < 16) ? order[b] : (int)b;
+                aa_bank_read_inputs[capture_idx] = make_input(aa_bank_slice_storage[b]);
+            }
+            runner_ctx.aa_bank_read = &aa_bank_read_inputs;
         }
 
         ggml_tensor* out = unet.forward(&runner_ctx,
@@ -869,7 +946,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                                         y,
                                         num_video_frames,
                                         controls,
-                                        control_strength);
+                                        control_strength,
+                                        pose_feature);
 
         ggml_build_forward_expand(gf, out);
 
@@ -886,14 +964,18 @@ struct UNetModelRunner : public DiffusionModelRunner {
                               const std::vector<sd::Tensor<float>>& controls = {},
                               float control_strength                         = 0.f,
                               const sd::Tensor<float>& ip_context            = {},
-                              float ip_scale                                 = 1.f) {
+                              float ip_scale                                 = 1.f,
+                              const std::vector<sd::Tensor<float>>* aa_banks = nullptr,
+                              bool aa_is_uncond                              = false,
+                              const sd::Tensor<float>& aa_pose_feature       = {}) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 77, 768]) or [1, max_position, hidden_size]
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> ggml_cgraph* {
-            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, ip_context, ip_scale);
+            return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, ip_context, ip_scale,
+                               aa_banks, aa_is_uncond, aa_pose_feature);
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
@@ -915,7 +997,10 @@ struct UNetModelRunner : public DiffusionModelRunner {
                        extra->controls ? *extra->controls : empty_controls,
                        extra->control_strength,
                        extra->ip_context ? *extra->ip_context : sd::Tensor<float>{},
-                       extra->ip_scale);
+                       extra->ip_scale,
+                       extra->aa_banks,
+                       extra->aa_is_uncond,
+                       extra->aa_pose_feature ? *extra->aa_pose_feature : sd::Tensor<float>{});
     }
 
     // AnimateAnyone ReferenceNet: one forward at t=0 with the CFG-doubled ref
@@ -958,9 +1043,20 @@ struct UNetModelRunner : public DiffusionModelRunner {
         std::vector<float> timesteps_vec(static_cast<size_t>(n), 0.f);  // one forward at t=0
         auto timesteps = sd::Tensor<float>::from_vector(timesteps_vec);
 
-        aa_capture_banks = true;
-        auto out         = compute(n_threads, ref_latents_cfg2, timesteps, clip_embeds_cfg2);
-        aa_capture_banks = false;
+        // Graph-cut/streaming incompatibility (task 6 review finding): the
+        // segmented compute path (GGMLRunner::compute_graph_cut_segments)
+        // calls free_cache_ctx_and_buffer() after a successful compute, which
+        // would wipe the aa.bank.* cache tensors before the readback below.
+        // Disable that path for the capture forward by zeroing the VRAM
+        // budget (can_attempt_graph_cut_segmented_compute requires a nonzero
+        // max_graph_vram_bytes); the budget is restored right after, so
+        // normal computes on this runner keep their configured streaming.
+        size_t saved_max_graph_vram_bytes = max_graph_vram_bytes;
+        max_graph_vram_bytes              = 0;
+        aa_capture_banks                  = true;
+        auto out                          = compute(n_threads, ref_latents_cfg2, timesteps, clip_embeds_cfg2);
+        aa_capture_banks                  = false;
+        max_graph_vram_bytes              = saved_max_graph_vram_bytes;
         if (out.empty()) {
             LOG_ERROR("reference net forward failed");
             return banks;

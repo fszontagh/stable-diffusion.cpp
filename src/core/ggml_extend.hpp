@@ -1155,21 +1155,24 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
         p1 = 0;
     }
 
-    if (direct) {
-        x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
-    } else if (w->type == GGML_TYPE_F32) {
+    if (w->type == GGML_TYPE_F32) {
         // Full-precision conv path. ggml_conv_2d always im2cols the activations
         // to F16 (and a mixed-type mul_mat would downcast F32 kernels to F16
         // anyway), so an F32 kernel would silently lose its extra precision.
         // Kernels are only F32 when a caller opted in via Conv2d::set_force_f32
-        // (the AnimateAnyone ReferenceNet); every existing caller has F16
-        // kernels and takes the ggml_conv_2d branch below, unchanged.
+        // (the AnimateAnyone runners); every existing caller has F16 kernels
+        // and takes the direct/ggml_conv_2d branches below, unchanged. This
+        // check deliberately takes precedence over `direct`: a runner that
+        // opted into F32 kernels did so for accuracy, and routing it through
+        // ggml_conv_2d_direct would silently drop back to reduced precision.
         ggml_tensor* im2col = ggml_im2col(ctx, w, x, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F32);  // [N, OH, OW, IC*KH*KW]
         ggml_tensor* result = ggml_mul_mat(ctx,
                                            ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
                                            ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1] * w->ne[2], w->ne[3]));
         result              = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], w->ne[3]);  // [OC, N, OH, OW]
         x                   = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2));                                // [N, OC, OH, OW]
+    } else if (direct) {
+        x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
         x = ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
     }
@@ -1734,16 +1737,6 @@ struct WeightAdapter {
     virtual size_t get_extra_graph_size()                                                                                             = 0;
 };
 
-// AnimateAnyone ReferenceNet hidden-state bank capture handle. When a runner
-// sets GGMLRunnerContext::aa_bank_capture during graph build, each
-// BasicTransformerBlock with an assigned bank index records its post-norm1
-// hidden states here (and persists them via the cache mechanism). Inert for
-// every other model family: the pointer defaults to nullptr and nothing sets it
-// outside the ReferenceNet path.
-struct AABankCapture {
-    std::vector<ggml_tensor*> tensors;  // indexed by BasicTransformerBlock DFS index
-};
-
 struct GGMLRunnerContext {
     ggml_backend_t backend                                           = nullptr;
     ggml_context* ggml_ctx                                           = nullptr;
@@ -1753,13 +1746,18 @@ struct GGMLRunnerContext {
     bool circular_y_enabled                                          = false;
     ggml_tensor* ip_context                                          = nullptr;
     float ip_scale                                                   = 1.0f;
-    // AnimateAnyone ReferenceNet bank hooks (nullptr = disabled, the default).
-    // Write side: filled by the ReferenceNet forward (task 6). Read side:
-    // consumed by the denoising UNet's concat-KV self-attention (task 7); the
-    // member is declared here so both sides share one context plumbing point,
-    // but nothing reads it yet.
-    AABankCapture* aa_bank_capture                                   = nullptr;
-    const std::vector<sd::Tensor<float>>* aa_bank_read               = nullptr;
+    // AnimateAnyone ReferenceNet bank hooks (disabled by default; only the
+    // AnimateAnyone runners in unet.hpp ever enable them, so every other model
+    // family builds a byte-identical graph).
+    // Write side (task 6): when aa_bank_capture_enabled is set during graph
+    // build, each BasicTransformerBlock with an assigned bank index persists
+    // its post-norm1 hidden states via the runner cache under "aa.bank.<idx>".
+    // Read side (task 7): aa_bank_read points at per-block optional graph
+    // inputs (indexed by the same DFS bank index; nullptr entry = no bank for
+    // that block); when set, attn1 runs with context = concat(x, bank) on the
+    // sequence dim (concat-KV, P-map section 2 read mode).
+    bool aa_bank_capture_enabled                                     = false;
+    const std::vector<ggml_tensor*>* aa_bank_read                    = nullptr;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;

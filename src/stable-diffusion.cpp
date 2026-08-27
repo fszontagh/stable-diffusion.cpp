@@ -24,6 +24,7 @@
 #include "extensions/generation_extension.h"
 #include "model/adapter/ip_adapter.hpp"
 #include "model/adapter/lora.hpp"
+#include "model/adapter/pose_guider.hpp"
 #include "model/diffusion/anima.hpp"
 #include "model/diffusion/animatediff.hpp"
 #include "model/diffusion/boogu.hpp"
@@ -235,6 +236,9 @@ public:
     // UNetModelRunner (not the DiffusionModelRunner base) because its only
     // entry point is compute_reference_banks().
     std::shared_ptr<UNetModelRunner> reference_net;
+    // AnimateAnyone pose guider (Moore PoseGuiderA): pose skeleton image ->
+    // [W/8, H/8, 320, N] feature added to the UNet conv_in output.
+    std::shared_ptr<AnimateAnyone::PoseGuiderRunner> pose_guider;
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<AudioVAERunner> audio_vae_model;
@@ -740,6 +744,16 @@ public:
             LOG_INFO("loading reference net from '%s'", sd_ctx_params->reference_net_path);
             if (!model_loader.init_from_file(sd_ctx_params->reference_net_path, "model.reference_net.")) {
                 LOG_WARN("loading reference net from '%s' failed", sd_ctx_params->reference_net_path);
+            }
+        }
+
+        if (strlen(SAFE_STR(sd_ctx_params->pose_guider_path)) > 0) {
+            LOG_INFO("loading pose guider from '%s'", sd_ctx_params->pose_guider_path);
+            // pose_guider.pth keys (conv_in.*, blocks.0..5.*, conv_out.*) match
+            // PoseGuiderA's block dict verbatim; the "pose_guider." prefix just
+            // namespaces them in the shared tensor map.
+            if (!model_loader.init_from_file(sd_ctx_params->pose_guider_path, "pose_guider.")) {
+                LOG_WARN("loading pose guider from '%s' failed", sd_ctx_params->pose_guider_path);
             }
         }
 
@@ -1349,21 +1363,40 @@ public:
                                                                      tensor_storage_map,
                                                                      "model.diffusion_model",
                                                                      model_manager);
-            } else {  // SD1.x SD2.x SDXL
-                std::map<std::string, std::string> embbeding_map;
-                for (uint32_t i = 0; i < sd_ctx_params->embedding_count; i++) {
-                    embbeding_map.emplace(SAFE_STR(sd_ctx_params->embeddings[i].name), SAFE_STR(sd_ctx_params->embeddings[i].path));
+            } else {  // SD1.x SD2.x SDXL (VERSION_ANIMATE_ANYONE included: SD1-family)
+                if (sd_version_is_animate_anyone(version)) {
+                    // AnimateAnyone: the conditioner is the sd-image-variations
+                    // CLIP-vision encoder (no text encoder at all), loaded via
+                    // --clip_vision under "cond_stage_model.transformer.".
+                    cond_stage_model = std::make_shared<AnimateAnyoneVisionConditioner>(backend_for(SDBackendModule::TE),
+                                                                                        tensor_storage_map,
+                                                                                        model_manager);
+                    // Unlike the ReferenceNet (task 6), the denoising UNet
+                    // does NOT need F32 conv kernels: measured at default F16
+                    // the single-frame step fixture passes at rel L2 4.35e-4
+                    // (tolerance 1e-3, task 7 report), so it uses the
+                    // standard constructor path.
+                    diffusion_model = std::make_shared<UNetModelRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                        tensor_storage_map,
+                                                                        "model.diffusion_model",
+                                                                        version,
+                                                                        model_manager);
+                } else {
+                    std::map<std::string, std::string> embbeding_map;
+                    for (uint32_t i = 0; i < sd_ctx_params->embedding_count; i++) {
+                        embbeding_map.emplace(SAFE_STR(sd_ctx_params->embeddings[i].name), SAFE_STR(sd_ctx_params->embeddings[i].path));
+                    }
+                    cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(backend_for(SDBackendModule::TE),
+                                                                                           tensor_storage_map,
+                                                                                           embbeding_map,
+                                                                                           version,
+                                                                                           model_manager);
+                    diffusion_model  = std::make_shared<UNetModelRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                        tensor_storage_map,
+                                                                        "model.diffusion_model",
+                                                                        version,
+                                                                        model_manager);
                 }
-                cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(backend_for(SDBackendModule::TE),
-                                                                                       tensor_storage_map,
-                                                                                       embbeding_map,
-                                                                                       version,
-                                                                                       model_manager);
-                diffusion_model  = std::make_shared<UNetModelRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                    tensor_storage_map,
-                                                                    "model.diffusion_model",
-                                                                    version,
-                                                                    model_manager);
                 if (sd_ctx_params->diffusion_conv_direct) {
                     LOG_INFO("Using Conv2d direct in the diffusion model");
                     diffusion_model->set_conv2d_direct_enabled(true);
@@ -1378,6 +1411,12 @@ public:
                                                                       version,
                                                                       model_manager,
                                                                       /*reference_headless=*/true);
+                }
+                if (strlen(SAFE_STR(sd_ctx_params->pose_guider_path)) > 0) {
+                    pose_guider = std::make_shared<AnimateAnyone::PoseGuiderRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                    tensor_storage_map,
+                                                                                    "pose_guider",
+                                                                                    model_manager);
                 }
             }
 
@@ -1414,6 +1453,16 @@ public:
                 reference_net->set_stream_layers_enabled(stream_layers);
                 if (!register_runner_params("Reference net",
                                             reference_net,
+                                            SDBackendModule::DIFFUSION,
+                                            &unet_params_mem_size)) {
+                    return false;
+                }
+            }
+
+            if (pose_guider) {
+                pose_guider->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::DIFFUSION));
+                if (!register_runner_params("Pose guider",
+                                            pose_guider,
                                             SDBackendModule::DIFFUSION,
                                             &unet_params_mem_size)) {
                     return false;

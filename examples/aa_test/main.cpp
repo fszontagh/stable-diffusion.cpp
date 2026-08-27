@@ -100,7 +100,22 @@ static void print_usage() {
             "      <fixtures>/clip_embeds.npy as cross-attn context, captures the 16\n"
             "      post-norm1 hidden-state banks, and compares each against\n"
             "      <fixtures>/ref_bank_00..15.npy at rel L2 <= 1e-3. Prints the per-bank\n"
-            "      error table and the worst bank. Exits 0 only if all checks pass.\n");
+            "      error table and the worst bank. Exits 0 only if all checks pass.\n"
+            "  unet-step-f1 [--diffusion-model <path>] [--motion-module <path>] [--fixtures <dir>]\n"
+            "               [--threads <n>] [--conv-f32]\n"
+            "      Loads denoising_unet.pth + motion_module.pth (defaults: $SDCPP_AA_WEIGHTS or\n"
+            "      /data/sdcpp-pixel-refs/weights, plus /AnimateAnyone/<file>). The motion\n"
+            "      modules run even at F=1 (temporal attention over one frame is NOT a no-op\n"
+            "      and the fixture was generated with them active).\n"
+            "      Runs one denoising step at t=999 on <fixtures>/unet_step_f1_in.npy\n"
+            "      (CFG batch 2, uncond row 0 / cond row 1) as TWO separate forwards: the\n"
+            "      uncond half with plain self-attention and NO reference, the cond half\n"
+            "      with the FIXTURE banks (ref_bank_00..15.npy, row 1) injected into every\n"
+            "      attn1 as concat-KV context. Both halves get the fixture pose feature\n"
+            "      (pose_guider_a_out.npy, added after conv_in) and their clip_embeds.npy\n"
+            "      row as cross-attn context. Reassembles [2,4,1,64,64] and compares\n"
+            "      against <fixtures>/unet_step_f1.npy at rel L2 <= 1e-3 (per-half and\n"
+            "      combined errors printed). Exits 0 on pass.\n");
 }
 
 static int run_version_mode(int argc, char** argv) {
@@ -159,44 +174,11 @@ static int run_version_mode(int argc, char** argv) {
     return 0;
 }
 
-// Standalone GGMLRunner wrapper around AnimateAnyone::PoseGuiderA, modeled
-// directly on LTXVUpsampler::LatentUpsamplerRunner (src/model/upscaler/ltx_latent_upscaler.hpp:431).
-struct PoseGuiderRunner : public GGMLRunner {
-    AnimateAnyone::PoseGuiderA model;
-
-    PoseGuiderRunner(ggml_backend_t backend,
-                     const String2TensorStorage& tensor_storage_map,
-                     std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-        : GGMLRunner(backend, weight_manager) {
-        model.init(params_ctx, tensor_storage_map, "");
-    }
-
-    std::string get_desc() override {
-        return "pose_guider";
-    }
-
-    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
-        model.get_param_tensors(tensors);
-    }
-
-    ggml_cgraph* build_graph(const sd::Tensor<float>& pose_tensor) {
-        ggml_cgraph* gf  = new_graph_custom(4096);
-        ggml_tensor* x   = make_input(pose_tensor);
-        auto runner_ctx  = get_context();
-        ggml_tensor* out = model.forward(&runner_ctx, x);
-        ggml_build_forward_expand(gf, out);
-        return gf;
-    }
-
-    sd::Tensor<float> compute(int n_threads, const sd::Tensor<float>& pose_tensor) {
-        auto get_graph = [&]() -> ggml_cgraph* { return build_graph(pose_tensor); };
-        // GGMLRunner::compute() drops trailing singleton dims (ggml_n_dims
-        // ignores them), so a batch-1 [W,H,C,N=1] result comes back as a 3D
-        // [W,H,C] tensor unless restored - matches the LatentUpsamplerRunner
-        // precedent (ltx_latent_upscaler.hpp:502).
-        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), 4);
-    }
-};
+// PoseGuiderRunner was promoted to src/model/adapter/pose_guider.hpp
+// (AnimateAnyone::PoseGuiderRunner) in task 7 so stable-diffusion.cpp can
+// construct it too; this test now uses the shared runner with an empty prefix
+// (the checkpoint keys match PoseGuiderA's block dict verbatim).
+using AnimateAnyone::PoseGuiderRunner;
 
 static int run_pose_guider_mode(int argc, char** argv) {
     std::string weights_path = aa_weights_root() + "/AnimateAnyone/pose_guider.pth";
@@ -261,7 +243,7 @@ static int run_pose_guider_mode(int argc, char** argv) {
         return 1;
     }
 
-    PoseGuiderRunner runner(cpu_backend, model_loader.get_tensor_storage_map(), model_manager);
+    PoseGuiderRunner runner(cpu_backend, model_loader.get_tensor_storage_map(), "", model_manager);
 
     std::map<std::string, ggml_tensor*> tensors;
     runner.get_param_tensors(tensors);
@@ -1321,6 +1303,272 @@ static int run_ref_bank_mode(int argc, char** argv) {
     return 0;
 }
 
+// mode `unet-step-f1`: reference-bank injection in the denoising UNet, single
+// frame (task 7).
+//
+// Semantics (P-map section 2 read mode + CFG handling): the runner performs
+// SEPARATE forwards for the uncond and cond CFG halves so each graph is
+// static. The COND forward injects the fixture banks' row 1 into every attn1
+// as concat-KV context (Q from the current states, K/V from concat(x, bank) on
+// the sequence dim, re-projected through each block's own to_k/to_v). The
+// UNCOND forward gets no banks at all - plain self-attention (bank row 0 is
+// deliberately never used). Both forwards add the fixture pose feature to the
+// conv_in output and use their clip_embeds.npy row as attn2 context. The
+// fixture banks are used directly (NOT recomputed via the ReferenceNet) so
+// this mode isolates the injection + step math from task 6's capture path.
+static int run_unet_step_f1_mode(int argc, char** argv) {
+    std::string unet_path          = aa_weights_root() + "/AnimateAnyone/denoising_unet.pth";
+    std::string motion_module_path = aa_weights_root() + "/AnimateAnyone/motion_module.pth";
+    std::string fixtures_dir;
+    if (const char* env = std::getenv("SDCPP_AA_FIXTURES")) {
+        fixtures_dir = env;
+    } else {
+        fixtures_dir = "/data/sdcpp-pixel-refs/fixtures";
+    }
+    int n_threads = static_cast<int>(std::thread::hardware_concurrency());
+    if (n_threads <= 0) {
+        n_threads = 4;
+    }
+    // Conv kernel precision. Measured (task-7-report.md): the default F16
+    // conv kernels give combined rel L2 4.35e-4 and F32 gives 2.27e-4 - both
+    // inside the 1e-3 tolerance, so unlike the ReferenceNet (task 6) the
+    // denoising UNet does NOT need set_force_f32. Default F16; --conv-f32
+    // keeps the tighter measurement reproducible.
+    bool force_conv_f32 = false;
+
+    for (int i = 0; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--diffusion-model") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --diffusion-model requires a value\n");
+                return 1;
+            }
+            unet_path = argv[++i];
+        } else if (arg == "--motion-module") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --motion-module requires a value\n");
+                return 1;
+            }
+            motion_module_path = argv[++i];
+        } else if (arg == "--fixtures") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --fixtures requires a value\n");
+                return 1;
+            }
+            fixtures_dir = argv[++i];
+        } else if (arg == "--threads") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --threads requires a value\n");
+                return 1;
+            }
+            n_threads = std::atoi(argv[++i]);
+        } else if (arg == "--conv-f16") {
+            force_conv_f32 = false;
+        } else if (arg == "--conv-f32") {
+            force_conv_f32 = true;
+        } else {
+            fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+            return 1;
+        }
+    }
+
+    auto rel_l2 = [](const float* got, const float* want, int64_t n) -> double {
+        double num = 0.0, den = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            double diff = static_cast<double>(got[i]) - static_cast<double>(want[i]);
+            num += diff * diff;
+            den += static_cast<double>(want[i]) * static_cast<double>(want[i]);
+        }
+        return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+    };
+
+    std::string npy_error;
+
+    // --- Step input/output fixtures: (2,4,1,64,64), CFG batch 2, uncond first,
+    // t=999. Numpy C-order flat index n*(4*64*64)+c*(64*64)+h*64+w (F=1 drops
+    // out) == ggml [64,64,4,2] flat index - same formula, direct flat copy. ---
+    aa_test::NpyArray step_in_npy, step_out_npy;
+    if (!aa_test::load_npy_f32(fixtures_dir + "/unet_step_f1_in.npy", step_in_npy, npy_error) ||
+        !aa_test::load_npy_f32(fixtures_dir + "/unet_step_f1.npy", step_out_npy, npy_error)) {
+        fprintf(stderr, "error: %s\n", npy_error.c_str());
+        return 1;
+    }
+    for (const aa_test::NpyArray* arr : {&step_in_npy, &step_out_npy}) {
+        if (arr->shape.size() != 5 || arr->shape[0] != 2 || arr->shape[1] != 4 ||
+            arr->shape[2] != 1 || arr->shape[3] != 64 || arr->shape[4] != 64) {
+            fprintf(stderr, "error: unexpected unet_step_f1 fixture shape (expected (2,4,1,64,64))\n");
+            return 1;
+        }
+    }
+    const int64_t half_numel = 4 * 64 * 64;
+
+    // --- Fixture banks in bank order, ggml [C, L, 2] (numpy (2, L, C) C-order is
+    // flat-layout-identical - same reasoning as ref-bank mode). ---
+    static const int64_t bank_width[16]  = {1280, 1280, 1280, 1280, 1280, 1280,
+                                            640, 640, 640, 640, 640,
+                                            320, 320, 320, 320, 320};
+    static const int64_t bank_tokens[16] = {256, 256, 256, 256, 256, 64,
+                                            1024, 1024, 1024, 1024, 1024,
+                                            4096, 4096, 4096, 4096, 4096};
+    std::vector<sd::Tensor<float>> banks;
+    banks.reserve(16);
+    for (int i = 0; i < 16; ++i) {
+        char bank_name[32];
+        snprintf(bank_name, sizeof(bank_name), "ref_bank_%02d.npy", i);
+        aa_test::NpyArray bank_npy;
+        if (!aa_test::load_npy_f32(fixtures_dir + "/" + bank_name, bank_npy, npy_error)) {
+            fprintf(stderr, "error: %s\n", npy_error.c_str());
+            return 1;
+        }
+        if (bank_npy.shape.size() != 3 || bank_npy.shape[0] != 2 ||
+            bank_npy.shape[1] != bank_tokens[i] || bank_npy.shape[2] != bank_width[i]) {
+            fprintf(stderr, "error: bank %02d fixture shape mismatch vs expected (2,%lld,%lld)\n",
+                    i, (long long)bank_tokens[i], (long long)bank_width[i]);
+            return 1;
+        }
+        sd::Tensor<float> bank({bank_width[i], bank_tokens[i], 2});
+        std::copy(bank_npy.data.begin(), bank_npy.data.end(), bank.data());
+        banks.push_back(std::move(bank));
+    }
+
+    // --- CLIP embeds (2,1,768): row 0 zeros uncond, row 1 cond. ---
+    aa_test::NpyArray clip_embeds_npy;
+    if (!aa_test::load_npy_f32(fixtures_dir + "/clip_embeds.npy", clip_embeds_npy, npy_error)) {
+        fprintf(stderr, "error: %s\n", npy_error.c_str());
+        return 1;
+    }
+    if (clip_embeds_npy.shape.size() != 3 || clip_embeds_npy.shape[0] != 2 ||
+        clip_embeds_npy.shape[1] != 1 || clip_embeds_npy.shape[2] != 768) {
+        fprintf(stderr, "error: unexpected clip_embeds.npy shape (expected (2,1,768))\n");
+        return 1;
+    }
+
+    // --- Fixture pose feature (1,320,1,64,64) -> ggml [64,64,320,1] (flat-
+    // identical, see pose-guider mode). Same feature feeds both CFG halves
+    // (the reference CFG-duplicates it, pipeline_pose2img.py:289-291). ---
+    aa_test::NpyArray pose_npy;
+    if (!aa_test::load_npy_f32(fixtures_dir + "/pose_guider_a_out.npy", pose_npy, npy_error)) {
+        fprintf(stderr, "error: %s\n", npy_error.c_str());
+        return 1;
+    }
+    if (pose_npy.shape.size() != 5 || pose_npy.shape[0] != 1 || pose_npy.shape[1] != 320 ||
+        pose_npy.shape[2] != 1 || pose_npy.shape[3] != 64 || pose_npy.shape[4] != 64) {
+        fprintf(stderr, "error: unexpected pose_guider_a_out.npy shape (expected (1,320,1,64,64))\n");
+        return 1;
+    }
+    sd::Tensor<float> pose_feature({64, 64, 320, 1});
+    std::copy(pose_npy.data.begin(), pose_npy.data.end(), pose_feature.data());
+
+    // --- Load the denoising UNet + motion module. denoising_unet.pth carries
+    // ONLY the spatial weights (686 keys, verified: zero motion_modules.*
+    // keys); the temporal weights come from motion_module.pth, exactly as the
+    // reference builds the model (from_pretrained_2d merges motion_module.pth,
+    // then denoising_unet.pth is loaded strict=False on top). The motion keys
+    // load under the fork's AnimateDiff prefix
+    // "model.diffusion_model.motion_module." (no name conversion - the
+    // checkpoint already uses down_blocks.i.motion_modules.j... names), which
+    // UNetConfig::detect_from_weights probes to enable the motion blocks. ---
+    auto unet_manager = std::make_shared<ModelManager>();
+    unet_manager->set_n_threads(1);
+    ModelLoader& unet_loader = unet_manager->loader();
+    if (!unet_loader.init_from_file_and_convert_name(unet_path, "model.diffusion_model.", VERSION_SD1)) {
+        fprintf(stderr, "error: failed to load denoising unet from '%s'\n", unet_path.c_str());
+        return 1;
+    }
+    if (!unet_loader.init_from_file(motion_module_path, "model.diffusion_model.motion_module.")) {
+        fprintf(stderr, "error: failed to load motion module from '%s'\n", motion_module_path.c_str());
+        return 1;
+    }
+
+    ggml_backend_t cpu_backend = sd_backend_cpu_init();
+    if (cpu_backend == nullptr) {
+        fprintf(stderr, "error: failed to init CPU backend\n");
+        return 1;
+    }
+
+    printf("conv precision: %s\n", force_conv_f32 ? "f32" : "f16");
+    UNetModelRunner runner(cpu_backend, unet_loader.get_tensor_storage_map(), "model.diffusion_model",
+                           VERSION_ANIMATE_ANYONE, unet_manager,
+                           /*reference_headless=*/false, force_conv_f32);
+
+    std::map<std::string, ggml_tensor*> unet_tensors;
+    runner.get_param_tensors(unet_tensors, "model.diffusion_model");
+    // Denoising UNet keeps its output head (unlike the ReferenceNet).
+    bool out_bound = false;
+    for (const auto& kv : unet_tensors) {
+        if (kv.first.rfind("model.diffusion_model.out.", 0) == 0) {
+            out_bound = true;
+            break;
+        }
+    }
+    if (!out_bound) {
+        fprintf(stderr, "error: denoising UNet did not allocate its output head (out.*)\n");
+        return 1;
+    }
+    if (!unet_manager->register_param_tensors("denoising_unet", unet_tensors,
+                                              ModelManager::ResidencyMode::ParamBackend,
+                                              cpu_backend, cpu_backend) ||
+        !unet_manager->validate_registered_tensors()) {
+        fprintf(stderr, "error: failed to register denoising unet tensors with the model manager\n");
+        return 1;
+    }
+
+    // --- Two forwards at t=999: row 0 = uncond (no banks), row 1 = cond
+    // (banks injected). Driven through the DiffusionParams/UNetDiffusionExtra
+    // path, the same entry point the generation loop will use in task 9. ---
+    std::vector<float> combined(2 * half_numel);
+    std::vector<float> timesteps_vec(1, 999.f);
+    auto timesteps = sd::Tensor<float>::from_vector(timesteps_vec);
+    double half_err[2] = {0.0, 0.0};
+    for (int h = 0; h < 2; ++h) {
+        sd::Tensor<float> x_half({64, 64, 4, 1});
+        std::copy(step_in_npy.data.begin() + h * half_numel,
+                  step_in_npy.data.begin() + (h + 1) * half_numel,
+                  x_half.data());
+        sd::Tensor<float> context_half({768, 1, 1});
+        std::copy(clip_embeds_npy.data.begin() + h * 768,
+                  clip_embeds_npy.data.begin() + (h + 1) * 768,
+                  context_half.data());
+
+        UNetDiffusionExtra extra;
+        extra.num_video_frames = 1;
+        extra.aa_banks         = &banks;
+        extra.aa_is_uncond     = (h == 0);
+        extra.aa_pose_feature  = &pose_feature;
+
+        DiffusionParams params;
+        params.x         = &x_half;
+        params.timesteps = &timesteps;
+        params.context   = &context_half;
+        params.extra     = extra;
+
+        printf("running %s forward at t=999 (%d threads)...\n", h == 0 ? "UNCOND" : "COND", n_threads);
+        sd::Tensor<float> out = runner.compute(n_threads, params);
+        if (out.empty() || out.numel() != half_numel) {
+            fprintf(stderr, "error: %s forward failed (numel %lld, expected %lld)\n",
+                    h == 0 ? "uncond" : "cond",
+                    (long long)out.numel(), (long long)half_numel);
+            return 1;
+        }
+        std::copy(out.data(), out.data() + half_numel, combined.data() + h * half_numel);
+        half_err[h] = rel_l2(out.data(), step_out_npy.data.data() + h * half_numel, half_numel);
+    }
+    unet_manager.reset();
+
+    double combined_err = rel_l2(combined.data(), step_out_npy.data.data(), 2 * half_numel);
+    const double tol    = 1e-3;
+    printf("uncond half rel L2:   %g\n", half_err[0]);
+    printf("cond half rel L2:     %g\n", half_err[1]);
+    printf("combined rel L2:      %g (tolerance %g)\n", combined_err, tol);
+
+    if (combined_err > tol) {
+        fprintf(stderr, "FAIL: combined relative L2 error %g exceeds tolerance %g\n", combined_err, tol);
+        return 1;
+    }
+    printf("PASS: denoising UNet single-frame step matches reference within tolerance %g\n", tol);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     sd_set_log_callback(aa_test_log_cb, nullptr);
 
@@ -1340,6 +1588,8 @@ int main(int argc, char** argv) {
         return run_scheduler_mode(argc - 2, argv + 2);
     } else if (mode == "ref-bank") {
         return run_ref_bank_mode(argc - 2, argv + 2);
+    } else if (mode == "unet-step-f1") {
+        return run_unet_step_f1_mode(argc - 2, argv + 2);
     } else if (mode == "-h" || mode == "--help") {
         print_usage();
         return 0;

@@ -11,6 +11,12 @@ namespace AnimateDiff {
         int max_frames                     = 32;
         int64_t num_heads                  = 8;
         int norm_num_groups                = 32;
+        // GroupNorm eps for the temporal transformers. The AnimateDiff /
+        // AnimateAnyone reference (motion_module.py TemporalTransformer3DModel)
+        // uses 1e-6; this defaults to the fork's historical 1e-5 so existing
+        // AnimateDiff outputs are bit-identical, and AnimateAnyone (which is
+        // fixture-verified at rel L2 <= 1e-3) opts into the reference value.
+        float norm_eps                     = 1e-5f;
         std::vector<int64_t> down_channels = {320, 640, 1280, 1280};
         std::vector<int64_t> up_channels   = {1280, 1280, 640, 320};
         int num_down_motion_per_block      = 2;
@@ -98,8 +104,8 @@ namespace AnimateDiff {
 
     class TemporalTransformer : public GGMLBlock {
     public:
-        TemporalTransformer(int64_t channels, int64_t num_heads, int norm_num_groups, int max_frames) {
-            blocks["norm"]                 = std::shared_ptr<GGMLBlock>(new GroupNorm(norm_num_groups, channels));
+        TemporalTransformer(int64_t channels, int64_t num_heads, int norm_num_groups, int max_frames, float norm_eps = 1e-5f) {
+            blocks["norm"]                 = std::shared_ptr<GGMLBlock>(new GroupNorm(norm_num_groups, channels, norm_eps));
             blocks["proj_in"]              = std::shared_ptr<GGMLBlock>(new Linear(channels, channels, true));
             blocks["transformer_blocks.0"] = std::make_shared<TemporalTransformerBlock>(channels, num_heads, max_frames);
             blocks["proj_out"]             = std::shared_ptr<GGMLBlock>(new Linear(channels, channels, true));
@@ -133,8 +139,8 @@ namespace AnimateDiff {
 
     class MotionModule : public GGMLBlock {
     public:
-        MotionModule(int64_t channels, int64_t num_heads, int norm_num_groups, int max_frames) {
-            blocks["temporal_transformer"] = std::make_shared<TemporalTransformer>(channels, num_heads, norm_num_groups, max_frames);
+        MotionModule(int64_t channels, int64_t num_heads, int norm_num_groups, int max_frames, float norm_eps = 1e-5f) {
+            blocks["temporal_transformer"] = std::make_shared<TemporalTransformer>(channels, num_heads, norm_num_groups, max_frames, norm_eps);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, int64_t num_frames) {
@@ -153,19 +159,19 @@ namespace AnimateDiff {
                 int64_t ch = cfg.down_channels[i];
                 for (int j = 0; j < cfg.num_down_motion_per_block; ++j) {
                     blocks["down_blocks." + std::to_string(i) + ".motion_modules." + std::to_string(j)] =
-                        std::make_shared<MotionModule>(ch, cfg.num_heads, cfg.norm_num_groups, cfg.max_frames);
+                        std::make_shared<MotionModule>(ch, cfg.num_heads, cfg.norm_num_groups, cfg.max_frames, cfg.norm_eps);
                 }
             }
             for (int i = 0; i < static_cast<int>(cfg.up_channels.size()); ++i) {
                 int64_t ch = cfg.up_channels[i];
                 for (int j = 0; j < cfg.num_up_motion_per_block; ++j) {
                     blocks["up_blocks." + std::to_string(i) + ".motion_modules." + std::to_string(j)] =
-                        std::make_shared<MotionModule>(ch, cfg.num_heads, cfg.norm_num_groups, cfg.max_frames);
+                        std::make_shared<MotionModule>(ch, cfg.num_heads, cfg.norm_num_groups, cfg.max_frames, cfg.norm_eps);
                 }
             }
             if (cfg.enable_mid_block) {
                 blocks["mid_block.motion_modules.0"] =
-                    std::make_shared<MotionModule>(cfg.mid_channels, cfg.num_heads, cfg.norm_num_groups, cfg.max_frames);
+                    std::make_shared<MotionModule>(cfg.mid_channels, cfg.num_heads, cfg.norm_num_groups, cfg.max_frames, cfg.norm_eps);
             }
         }
 
