@@ -115,7 +115,16 @@ static void print_usage() {
             "      (pose_guider_a_out.npy, added after conv_in) and their clip_embeds.npy\n"
             "      row as cross-attn context. Reassembles [2,4,1,64,64] and compares\n"
             "      against <fixtures>/unet_step_f1.npy at rel L2 <= 1e-3 (per-half and\n"
-            "      combined errors printed). Exits 0 on pass.\n");
+            "      combined errors printed). Exits 0 on pass.\n"
+            "  unet-step-f8 [--diffusion-model <path>] [--motion-module <path>] [--fixtures <dir>]\n"
+            "               [--threads <n>] [--conv-f32]\n"
+            "      Same as unet-step-f1 but F=8: <fixtures>/unet_step_f8_in.npy /\n"
+            "      unet_step_f8.npy (2,4,8,64,64). The fixture banks (still [C,L,2], one\n"
+            "      row per CFG half, no frame axis) are broadcast to all 8 frame rows\n"
+            "      before the per-frame seq-dim concat, and the fixture pose feature\n"
+            "      (still [64,64,320,1]) is broadcast the same way (P-map section 2 read-\n"
+            "      mode shapes). Exercises real temporal mixing through the motion\n"
+            "      modules and the pos-encoder slice beyond frame 0.\n");
 }
 
 static int run_version_mode(int argc, char** argv) {
@@ -1303,20 +1312,66 @@ static int run_ref_bank_mode(int argc, char** argv) {
     return 0;
 }
 
-// mode `unet-step-f1`: reference-bank injection in the denoising UNet, single
-// frame (task 7).
+// Picks a compute backend for unet-step-f1/f8. CPU remains the DEFAULT and
+// is what this mode's tolerance is fixture-verified against (task 7/8
+// reports); GPU is an explicit opt-in via SDCPP_AA_TEST_GPU=1, since on this
+// machine flash attention is required to fit the F=8 COND graph's largest
+// spatial block in 12 GB of VRAM (a naive, non-flash QK^T score matrix there
+// is ~8.6 GB by itself - see task 8 report), and flash attention's mandatory
+// K/V f16 cast measured combined rel L2 ~1.6e-2 at F=8 (16x over the 1e-3
+// tolerance, insensitive to --conv-f32) - a real GPU precision/memory
+// tradeoff, not a semantics bug, so it must never become the silent default
+// on a CUDA-enabled build.
+static ggml_backend_t aa_test_pick_backend() {
+    const char* want_gpu = std::getenv("SDCPP_AA_TEST_GPU");
+    if (want_gpu != nullptr && std::string(want_gpu) != "0") {
+        ggml_backend_load_all();
+        ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        if (gpu != nullptr) {
+            return gpu;
+        }
+        fprintf(stderr, "warning: SDCPP_AA_TEST_GPU requested but no GPU backend is available; falling back to CPU\n");
+    }
+    return sd_backend_cpu_init();
+}
+
+// Reorders one CFG half of a (c, f, h, w) PyTorch-flat fixture block into
+// this fork's ggml-flat [w, h, c, f] layout (frames on ne[3]) - or back
+// again, since the swap is its own inverse. PyTorch nests f INSIDE c;
+// this fork's ggml tensors nest c INSIDE f (frames the outermost/slowest
+// axis, R-map section 2). At F=1 this is the identity permutation (task 7's
+// flat copy happened to be correct only because the frame axis is absorbed);
+// at F>1 the two orders are a genuine transpose of the c/f nesting.
+static void reorder_pytorch_cf_ggml_fc(const float* src, float* dst, int64_t C, int64_t F, int64_t H, int64_t W) {
+    const int64_t plane = H * W;
+    for (int64_t f = 0; f < F; ++f) {
+        for (int64_t c = 0; c < C; ++c) {
+            const float* src_block = src + (c * F + f) * plane;
+            float* dst_block       = dst + (f * C + c) * plane;
+            std::copy(src_block, src_block + plane, dst_block);
+        }
+    }
+}
+
+// modes `unet-step-f1` / `unet-step-f8`: reference-bank injection in the
+// denoising UNet, single frame (task 7) and temporal (F=8, task 8).
 //
 // Semantics (P-map section 2 read mode + CFG handling): the runner performs
 // SEPARATE forwards for the uncond and cond CFG halves so each graph is
 // static. The COND forward injects the fixture banks' row 1 into every attn1
 // as concat-KV context (Q from the current states, K/V from concat(x, bank) on
-// the sequence dim, re-projected through each block's own to_k/to_v). The
-// UNCOND forward gets no banks at all - plain self-attention (bank row 0 is
-// deliberately never used). Both forwards add the fixture pose feature to the
-// conv_in output and use their clip_embeds.npy row as attn2 context. The
-// fixture banks are used directly (NOT recomputed via the ReferenceNet) so
-// this mode isolates the injection + step math from task 6's capture path.
-static int run_unet_step_f1_mode(int argc, char** argv) {
+// the sequence dim, re-projected through each block's own to_k/to_v) - at
+// F>1 the SAME bank content is broadcast to every frame row before the concat
+// (P-map section 2 read-mode shapes: bank_fea repeated across video_length,
+// then rearranged "b t l c -> (b t) l c"). The UNCOND forward gets no banks at
+// all - plain self-attention (bank row 0 is deliberately never used). Both
+// forwards add the fixture pose feature to the conv_in output (broadcast
+// across frames per the fixture generator's `pose_fea.repeat(1,1,F,1,1)`) and
+// use their clip_embeds.npy row as attn2 context (repeated per frame
+// generically inside UNetModel::forward). The fixture banks are used directly
+// (NOT recomputed via the ReferenceNet) so this mode isolates the injection +
+// step math from task 6's capture path.
+static int run_unet_step_mode(int argc, char** argv, int video_length, const char* tag) {
     std::string unet_path          = aa_weights_root() + "/AnimateAnyone/denoising_unet.pth";
     std::string motion_module_path = aa_weights_root() + "/AnimateAnyone/motion_module.pth";
     std::string fixtures_dir;
@@ -1384,23 +1439,27 @@ static int run_unet_step_f1_mode(int argc, char** argv) {
 
     std::string npy_error;
 
-    // --- Step input/output fixtures: (2,4,1,64,64), CFG batch 2, uncond first,
-    // t=999. Numpy C-order flat index n*(4*64*64)+c*(64*64)+h*64+w (F=1 drops
-    // out) == ggml [64,64,4,2] flat index - same formula, direct flat copy. ---
+    // --- Step input/output fixtures: (2,4,F,64,64), CFG batch 2, uncond first,
+    // t=999. PyTorch nests (c, f, h, w) - f INSIDE c. This fork's ggml layout
+    // is [w, h, c, f] (frames on ne[3], R-map section 2) - c INSIDE f. At F=1
+    // the frame axis is trivially absorbed so a flat copy happens to line up
+    // (task 7); at F>1 the two layouts are a genuine transpose of the c/f
+    // nesting and must be reordered per (c,f) H*W block, not flat-copied. ---
     aa_test::NpyArray step_in_npy, step_out_npy;
-    if (!aa_test::load_npy_f32(fixtures_dir + "/unet_step_f1_in.npy", step_in_npy, npy_error) ||
-        !aa_test::load_npy_f32(fixtures_dir + "/unet_step_f1.npy", step_out_npy, npy_error)) {
+    if (!aa_test::load_npy_f32(fixtures_dir + "/unet_step_" + tag + "_in.npy", step_in_npy, npy_error) ||
+        !aa_test::load_npy_f32(fixtures_dir + "/unet_step_" + tag + ".npy", step_out_npy, npy_error)) {
         fprintf(stderr, "error: %s\n", npy_error.c_str());
         return 1;
     }
     for (const aa_test::NpyArray* arr : {&step_in_npy, &step_out_npy}) {
         if (arr->shape.size() != 5 || arr->shape[0] != 2 || arr->shape[1] != 4 ||
-            arr->shape[2] != 1 || arr->shape[3] != 64 || arr->shape[4] != 64) {
-            fprintf(stderr, "error: unexpected unet_step_f1 fixture shape (expected (2,4,1,64,64))\n");
+            arr->shape[2] != video_length || arr->shape[3] != 64 || arr->shape[4] != 64) {
+            fprintf(stderr, "error: unexpected unet_step_%s fixture shape (expected (2,4,%d,64,64))\n",
+                    tag, video_length);
             return 1;
         }
     }
-    const int64_t half_numel = 4 * 64 * 64;
+    const int64_t half_numel = 4 * (int64_t)video_length * 64 * 64;
 
     // --- Fixture banks in bank order, ggml [C, L, 2] (numpy (2, L, C) C-order is
     // flat-layout-identical - same reasoning as ref-bank mode). ---
@@ -1480,16 +1539,43 @@ static int run_unet_step_f1_mode(int argc, char** argv) {
         return 1;
     }
 
-    ggml_backend_t cpu_backend = sd_backend_cpu_init();
+    ggml_backend_t cpu_backend = aa_test_pick_backend();
     if (cpu_backend == nullptr) {
-        fprintf(stderr, "error: failed to init CPU backend\n");
+        fprintf(stderr, "error: failed to init a compute backend\n");
         return 1;
     }
+    printf("compute backend: %s%s\n",
+          ggml_backend_name(cpu_backend),
+          sd_backend_is_cpu(cpu_backend) ? " (CPU)" : " (GPU)");
 
     printf("conv precision: %s\n", force_conv_f32 ? "f32" : "f16");
     UNetModelRunner runner(cpu_backend, unet_loader.get_tensor_storage_map(), "model.diffusion_model",
                            VERSION_ANIMATE_ANYONE, unet_manager,
                            /*reference_headless=*/false, force_conv_f32);
+    if (!sd_backend_is_cpu(cpu_backend) && video_length > 1) {
+        // At F=8 the COND graph's largest spatial block (input_blocks.1,
+        // 320ch/64x64=4096 tokens, bank-doubled K=8192, 8 frames) materializes
+        // a naive (non-flash) QK^T score matrix of ~4096*8192*8heads*8frames -
+        // ~8.6 GB by itself, measured directly (see task 8 report), which
+        // exceeds a 12 GB card regardless of graph-cut segmentation (a single
+        // block's peak is a floor segmentation cannot cut below - it only
+        // cuts BETWEEN named blocks). Flash attention (existing runner knob,
+        // block.hpp already threads ctx->flash_attn_enabled into every
+        // ggml_ext_attention_ext call) avoids materializing that matrix at
+        // all, which is the actual fix; the graph-cut budget below stays on
+        // as a secondary safety net for the remaining (much smaller) peaks.
+        // Gated to F>1 only: F=1's compute buffer is ~552 MB (measured), well
+        // under any 12 GB card without either knob, and flash attention's
+        // mandatory K/V f16 cast is pure precision loss with no OOM benefit
+        // there - confirmed empirically (F=1 canary regressed from 7.1e-4 to
+        // 1.37e-2 combined rel L2 when flash attention was left on for it).
+        runner.set_flash_attention_enabled(true);
+        size_t budget_mb = 2048;
+        if (const char* env = std::getenv("SDCPP_AA_VRAM_BUDGET_MB")) {
+            budget_mb = static_cast<size_t>(std::atoll(env));
+        }
+        runner.set_max_graph_vram_bytes(budget_mb * 1024ull * 1024ull);
+    }
 
     std::map<std::string, ggml_tensor*> unet_tensors;
     runner.get_param_tensors(unet_tensors, "model.diffusion_model");
@@ -1517,22 +1603,35 @@ static int run_unet_step_f1_mode(int argc, char** argv) {
     // (banks injected). Driven through the DiffusionParams/UNetDiffusionExtra
     // path, the same entry point the generation loop will use in task 9. ---
     std::vector<float> combined(2 * half_numel);
+    // Reference output, reordered per CFG half from PyTorch (c,f,h,w) into
+    // this fork's ggml [w,h,c,f] layout so it lines up element-for-element
+    // with `combined` (which the runner already produces in ggml order).
+    std::vector<float> want_reordered(2 * half_numel);
+    for (int h = 0; h < 2; ++h) {
+        reorder_pytorch_cf_ggml_fc(step_out_npy.data.data() + h * half_numel,
+                                   want_reordered.data() + h * half_numel,
+                                   4, video_length, 64, 64);
+    }
     std::vector<float> timesteps_vec(1, 999.f);
     auto timesteps = sd::Tensor<float>::from_vector(timesteps_vec);
     double half_err[2] = {0.0, 0.0};
     for (int h = 0; h < 2; ++h) {
-        sd::Tensor<float> x_half({64, 64, 4, 1});
-        std::copy(step_in_npy.data.begin() + h * half_numel,
-                  step_in_npy.data.begin() + (h + 1) * half_numel,
-                  x_half.data());
+        sd::Tensor<float> x_half({64, 64, 4, (int64_t)video_length});
+        reorder_pytorch_cf_ggml_fc(step_in_npy.data.data() + h * half_numel,
+                                   x_half.data(), 4, video_length, 64, 64);
         sd::Tensor<float> context_half({768, 1, 1});
         std::copy(clip_embeds_npy.data.begin() + h * 768,
                   clip_embeds_npy.data.begin() + (h + 1) * 768,
                   context_half.data());
 
         UNetDiffusionExtra extra;
-        extra.num_video_frames = 1;
-        extra.aa_banks         = &banks;
+        extra.num_video_frames = video_length;
+        // Carried finding (d) from task 7's review: pass no banks at all on
+        // the uncond forward - build_graph() already ignores aa_banks when
+        // aa_is_uncond is set, but a null pointer states the intent (no
+        // reference is ever read on this half) instead of relying on the
+        // callee to notice the flag.
+        extra.aa_banks         = (h == 0) ? nullptr : &banks;
         extra.aa_is_uncond     = (h == 0);
         extra.aa_pose_feature  = &pose_feature;
 
@@ -1551,11 +1650,11 @@ static int run_unet_step_f1_mode(int argc, char** argv) {
             return 1;
         }
         std::copy(out.data(), out.data() + half_numel, combined.data() + h * half_numel);
-        half_err[h] = rel_l2(out.data(), step_out_npy.data.data() + h * half_numel, half_numel);
+        half_err[h] = rel_l2(out.data(), want_reordered.data() + h * half_numel, half_numel);
     }
     unet_manager.reset();
 
-    double combined_err = rel_l2(combined.data(), step_out_npy.data.data(), 2 * half_numel);
+    double combined_err = rel_l2(combined.data(), want_reordered.data(), 2 * half_numel);
     const double tol    = 1e-3;
     printf("uncond half rel L2:   %g\n", half_err[0]);
     printf("cond half rel L2:     %g\n", half_err[1]);
@@ -1565,8 +1664,16 @@ static int run_unet_step_f1_mode(int argc, char** argv) {
         fprintf(stderr, "FAIL: combined relative L2 error %g exceeds tolerance %g\n", combined_err, tol);
         return 1;
     }
-    printf("PASS: denoising UNet single-frame step matches reference within tolerance %g\n", tol);
+    printf("PASS: denoising UNet F=%d step matches reference within tolerance %g\n", video_length, tol);
     return 0;
+}
+
+static int run_unet_step_f1_mode(int argc, char** argv) {
+    return run_unet_step_mode(argc, argv, 1, "f1");
+}
+
+static int run_unet_step_f8_mode(int argc, char** argv) {
+    return run_unet_step_mode(argc, argv, 8, "f8");
 }
 
 int main(int argc, char** argv) {
@@ -1590,6 +1697,8 @@ int main(int argc, char** argv) {
         return run_ref_bank_mode(argc - 2, argv + 2);
     } else if (mode == "unet-step-f1") {
         return run_unet_step_f1_mode(argc - 2, argv + 2);
+    } else if (mode == "unet-step-f8") {
+        return run_unet_step_f8_mode(argc - 2, argv + 2);
     } else if (mode == "-h" || mode == "--help") {
         print_usage();
         return 0;

@@ -637,6 +637,17 @@ public:
             // first residual block (unet_3d.py:503-505 adds before
             // down_block_res_samples is seeded). nullptr for every existing
             // family - only the AnimateAnyone runner passes a pose feature.
+            //
+            // F>1: the fixture generator computes the pose feature once per
+            // frame and finds it identical (a single pose image broadcast
+            // across all frames, dump_fixtures.py's `pose_fea.repeat(1,1,F,1,1)`)
+            // - so a single-frame [W,H,C,1] feature is repeated explicitly to
+            // every frame row here, matching the explicit-repeat style already
+            // used for `context`/`c_concat`/`y` above rather than relying on
+            // ggml_add's implicit broadcast.
+            if (pose_feature->ne[3] != h->ne[3]) {
+                pose_feature = ggml_repeat(ctx->ggml_ctx, pose_feature, h);
+            }
             h = ggml_add(ctx->ggml_ctx, h, pose_feature);
         }
         sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks.0", "h");
@@ -919,20 +930,36 @@ struct UNetModelRunner : public DiffusionModelRunner {
         aa_bank_read_inputs.clear();
         if (aa_banks != nullptr && !aa_is_uncond) {
             const size_t n_banks = aa_banks->size();
+            // Carried finding (a) from task 7's review: aa_bank_capture_order()
+            // is a fixed 16-entry table (one bank per BasicTransformerBlock in
+            // this SD1.5-shaped UNet). A short `aa_banks` vector (e.g. a failed
+            // compute_reference_banks()) would otherwise let capture_idx
+            // (drawn from `order`, values up to 15) index past a
+            // aa_bank_read_inputs vector sized to n_banks < 16 - a latent OOB
+            // write. Fail the forward loudly instead of silently corrupting
+            // memory or building a partial graph.
+            if (n_banks != 16) {
+                LOG_ERROR("aa banks: expected exactly 16 reference banks, got %zu", n_banks);
+                GGML_ASSERT(false && "AnimateAnyone: wrong number of reference banks");
+            }
             aa_bank_slice_storage.resize(n_banks);
             aa_bank_read_inputs.assign(n_banks, nullptr);
             const int* order = aa_bank_capture_order();
             for (size_t b = 0; b < n_banks; b++) {
                 const auto& bank = (*aa_banks)[b];
                 if (bank.dim() != 3 || bank.shape()[2] != 2) {
+                    // Carried finding (b): a malformed bank must fail the whole
+                    // forward, not be skipped while the other 15 banks are
+                    // still injected - a partial-injection graph is plausible
+                    // looking but silently wrong.
                     LOG_ERROR("aa bank %zu is not a CFG-doubled [C, L, 2] tensor", b);
-                    continue;
+                    GGML_ASSERT(false && "AnimateAnyone: malformed reference bank");
                 }
                 // Cond half = row 1 -> [C, L, 1] optional graph input, placed
                 // at this bank's DFS capture index (banks arrive in sorted
                 // bank order; blocks are indexed in capture order).
                 aa_bank_slice_storage[b] = sd::ops::slice(bank, 2, 1, 2);
-                int capture_idx          = (b < 16) ? order[b] : (int)b;
+                int capture_idx          = order[b];
                 aa_bank_read_inputs[capture_idx] = make_input(aa_bank_slice_storage[b]);
             }
             runner_ctx.aa_bank_read = &aa_bank_read_inputs;

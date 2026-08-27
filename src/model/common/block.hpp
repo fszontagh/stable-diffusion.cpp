@@ -482,7 +482,19 @@ public:
         if (ctx->aa_bank_read != nullptr && aa_bank_index >= 0 &&
             aa_bank_index < (int)ctx->aa_bank_read->size() &&
             (*ctx->aa_bank_read)[aa_bank_index] != nullptr) {
-            attn1_context = ggml_concat(ctx->ggml_ctx, x, (*ctx->aa_bank_read)[aa_bank_index], 1);
+            ggml_tensor* bank = (*ctx->aa_bank_read)[aa_bank_index];
+            if (bank->ne[2] != x->ne[2]) {
+                // F>1 (P-map section 2 read-mode shapes): each bank entry is
+                // [C, L, 1] (captured once from the CFG cond row, no frame
+                // axis) but x carries one row per video frame on this axis
+                // (the fork's spatial layers treat frames as batch entries,
+                // R-map section 4). The SAME bank content is read by every
+                // frame - "d.unsqueeze(1).repeat(1, video_length, 1, 1)" then
+                // "(b t) l c" - so broadcast/repeat the bank to one copy per
+                // frame row before the per-frame seq-dim concat below.
+                bank = ggml_repeat(ctx->ggml_ctx, bank, x);
+            }
+            attn1_context = ggml_concat(ctx->ggml_ctx, x, bank, 1);
         }
         x      = attn1->forward(ctx, x, attn1_context);  // self-attention (+optional reference tokens)
         x      = ggml_add(ctx->ggml_ctx, x, r);
