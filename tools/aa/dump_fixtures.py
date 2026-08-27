@@ -264,6 +264,12 @@ clip_image_processor = CLIPImageProcessor()
 clip_image = clip_image_processor.preprocess(
     ref_image.resize((224, 224)), return_tensors="pt"
 ).pixel_values
+# Save the exact preprocessed [1,3,224,224] fp32 tensor fed to the encoder, so the
+# C++ port's model-correctness check (sd-aa-test clip-embeds, STRICT check) can be
+# gated purely on the model, independent of how closely its own C++
+# image->resize->normalize preprocessing chain matches PIL/CLIPImageProcessor
+# bit-for-bit (that chain gets its own, looser PREPROCESS CHAIN check).
+save_npy("pixel_values", clip_image)
 clip_image_embeds = image_enc(clip_image.to(DEVICE, dtype=image_enc.dtype)).image_embeds
 image_prompt_embeds = clip_image_embeds.unsqueeze(1)  # (1, 1, 768)
 uncond_image_prompt_embeds = torch.zeros_like(image_prompt_embeds)
