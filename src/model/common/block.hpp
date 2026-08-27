@@ -492,7 +492,13 @@ public:
                 // frame - "d.unsqueeze(1).repeat(1, video_length, 1, 1)" then
                 // "(b t) l c" - so broadcast/repeat the bank to one copy per
                 // frame row before the per-frame seq-dim concat below.
-                bank = ggml_repeat(ctx->ggml_ctx, bank, x);
+                // ggml_repeat_4d pins the repetition to the frame axis (ne[2])
+                // only: bank keeps its own token count L (which can differ
+                // from x's sequence length in principle; a plain
+                // ggml_repeat(bank, x) would silently tile the token axis too
+                // if they ever diverged).
+                bank = ggml_repeat_4d(ctx->ggml_ctx, bank,
+                                      bank->ne[0], bank->ne[1], x->ne[2], bank->ne[3]);
             }
             attn1_context = ggml_concat(ctx->ggml_ctx, x, bank, 1);
         }

@@ -560,7 +560,8 @@ public:
                          int num_video_frames               = -1,
                          std::vector<ggml_tensor*> controls = {},
                          float control_strength             = 0.f,
-                         ggml_tensor* pose_feature          = nullptr) {
+                         ggml_tensor* pose_feature          = nullptr,
+                         bool aa_spatial_only               = false) {
         // x: [N, in_channels, h, w] or [N, in_channels/2, h, w]
         // timesteps: [N,]
         // context: [N, max_position, hidden_size] or [1, max_position, hidden_size]. for example, [N, 77, 768]
@@ -661,7 +662,10 @@ public:
         // value, which still passes through to_out/proj_out and the FF), and
         // the single-frame fixture was generated with them active. AnimateDiff
         // keeps its existing F>1 gate.
-        auto motion_root        = config.enable_animatediff &&
+        // aa_spatial_only (AnimateAnyone single-frame generation) skips the
+        // motion modules entirely: at F=1 they degenerate (task 9 finding, see
+        // UNetDiffusionExtra::aa_spatial_only).
+        auto motion_root        = config.enable_animatediff && !aa_spatial_only &&
                                           (num_video_frames > 1 || config.version == VERSION_ANIMATE_ANYONE)
                                       ? std::dynamic_pointer_cast<AnimateDiff::AnimateDiffModel>(blocks["motion_module"])
                                       : nullptr;
@@ -893,7 +897,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                              float ip_scale                                        = 1.f,
                              const std::vector<sd::Tensor<float>>* aa_banks        = nullptr,
                              bool aa_is_uncond                                     = false,
-                             const sd::Tensor<float>& aa_pose_feature              = {}) {
+                             const sd::Tensor<float>& aa_pose_feature              = {},
+                             bool aa_spatial_only                                  = false) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
 
         ggml_tensor* x            = make_input(x_tensor);
@@ -974,7 +979,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                                         num_video_frames,
                                         controls,
                                         control_strength,
-                                        pose_feature);
+                                        pose_feature,
+                                        aa_spatial_only);
 
         ggml_build_forward_expand(gf, out);
 
@@ -994,7 +1000,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                               float ip_scale                                 = 1.f,
                               const std::vector<sd::Tensor<float>>* aa_banks = nullptr,
                               bool aa_is_uncond                              = false,
-                              const sd::Tensor<float>& aa_pose_feature       = {}) {
+                              const sd::Tensor<float>& aa_pose_feature       = {},
+                              bool aa_spatial_only                           = false) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 77, 768]) or [1, max_position, hidden_size]
@@ -1002,7 +1009,7 @@ struct UNetModelRunner : public DiffusionModelRunner {
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> ggml_cgraph* {
             return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, ip_context, ip_scale,
-                               aa_banks, aa_is_uncond, aa_pose_feature);
+                               aa_banks, aa_is_uncond, aa_pose_feature, aa_spatial_only);
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
@@ -1027,7 +1034,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                        extra->ip_scale,
                        extra->aa_banks,
                        extra->aa_is_uncond,
-                       extra->aa_pose_feature ? *extra->aa_pose_feature : sd::Tensor<float>{});
+                       extra->aa_pose_feature ? *extra->aa_pose_feature : sd::Tensor<float>{},
+                       extra->aa_spatial_only);
     }
 
     // AnimateAnyone ReferenceNet: one forward at t=0 with the CFG-doubled ref

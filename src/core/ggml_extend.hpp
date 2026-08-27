@@ -3241,6 +3241,10 @@ public:
         flash_attn_enabled = enabled;
     }
 
+    bool is_flash_attention_enabled() const {
+        return flash_attn_enabled;
+    }
+
     void set_conv2d_direct_enabled(bool enabled) {
         conv2d_direct_enabled = enabled;
     }

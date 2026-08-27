@@ -59,6 +59,13 @@ struct UNetDiffusionExtra {
     const std::vector<sd::Tensor<float>>* aa_banks = nullptr;
     bool aa_is_uncond                              = false;
     const sd::Tensor<float>* aa_pose_feature       = nullptr;
+    // Skip the motion modules for this forward (single-frame generation).
+    // The motion modules were trained on 24-frame windows; at F=1 their
+    // temporal self-attention degenerates (verified empirically in task 9:
+    // the PyTorch reference pose2img flow with motion modules active at F=1
+    // fails to denoise - latent std grows monotonically and the output is
+    // noise - while the same flow without motion modules denoises normally).
+    bool aa_spatial_only = false;
 };
 
 struct SkipLayerDiffusionExtra {

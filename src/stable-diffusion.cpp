@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <set>
 #include <type_traits>
 #include <unordered_set>
@@ -58,6 +59,14 @@
 #include "model/vae/minimax_h3_audio_vae.hpp"
 #include "model/vae/minimax_h3_vae.hpp"
 #include "model/vae/tae.hpp"
+
+// AnimateAnyone pose frames arrive as a directory path (sd_img_gen_params_t::
+// pose_images_dir), so this translation unit loads the image files itself.
+// STB_IMAGE_STATIC keeps the symbols TU-local (examples/common/media_io.cpp
+// compiles its own copy for the CLI side).
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#include "stb_image.h"
 #include "model/vae/vae.hpp"
 #include "model/vae/wan_vae.hpp"
 #include "runtime/denoiser.hpp"
@@ -3180,6 +3189,20 @@ public:
         return latents;
     }
 
+    // AnimateAnyone reference latents: the reference pipeline uses the VAE
+    // posterior MEAN, not a gaussian sample (`vae.encode(...).latent_dist.mean`,
+    // P-map section 5 step 6), then the standard 0.18215 scaling. The regular
+    // encode_first_stage() path samples mean + std * noise, which would both
+    // perturb the reference identity and consume RNG state.
+    sd::Tensor<float> encode_first_stage_mean(const sd::Tensor<float>& x) {
+        auto vae_output = first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y);
+        if (vae_output.empty()) {
+            return {};
+        }
+        auto mean = sd::ops::chunk(vae_output, 2, 2)[0];
+        return first_stage_model->vae_to_diffusion_latents(mean);
+    }
+
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
         if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
@@ -5721,6 +5744,327 @@ static std::vector<float> make_hires_sigma_schedule(sd_ctx_t* sd_ctx,
                               sigmas.end());
 }
 
+/*========================= AnimateAnyone generation =========================*/
+
+// Lexicographically sorted list of regular files in `dir` (the documented
+// --pose-dir convention: frames stored as images named in character order).
+static std::vector<std::string> aa_list_pose_files(const char* dir) {
+    std::vector<std::string> files;
+    if (dir == nullptr || strlen(dir) == 0) {
+        return files;
+    }
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.is_regular_file()) {
+            files.push_back(entry.path().string());
+        }
+    }
+    if (ec) {
+        LOG_ERROR("failed to list pose dir '%s': %s", dir, ec.message().c_str());
+        files.clear();
+        return files;
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// Loads an image file as an fp32 tensor [W,H,3,1]. scale=true -> [0,1].
+// target_w/target_h > 0 resizes (sd_image_to_tensor's resize).
+static sd::Tensor<float> aa_load_image_tensor(const std::string& path, int target_w, int target_h, bool scale) {
+    int width = 0, height = 0, channels_in_file = 0;
+    unsigned char* pixels = stbi_load(path.c_str(), &width, &height, &channels_in_file, 3);
+    if (pixels == nullptr) {
+        LOG_ERROR("failed to load image '%s'", path.c_str());
+        return {};
+    }
+    sd_image_t image{static_cast<uint32_t>(width), static_cast<uint32_t>(height), 3, pixels};
+    sd::Tensor<float> tensor = sd_image_to_tensor(image, target_w, target_h, scale);
+    free(pixels);
+    return tensor;
+}
+
+// AnimateAnyone end-to-end generation (P-map section 5, pose2img/pose2vid):
+//  1. CLIP image embeds of the reference image (cond) + literal-zero uncond.
+//  2. Reference latents: VAE posterior MEAN * 0.18215.
+//  3. Pose guider forward once over all F pose frames (timestep-independent,
+//     cached across the whole denoise loop).
+//  4. ReferenceNet forward ONCE at t=0 with the CFG-doubled ref latents ->
+//     16 reference banks, reused unchanged across all steps.
+//  5. 25-step (default) trailing DDIM v-prediction zero-SNR loop at cfg 3.5:
+//     two separate UNet forwards per step (uncond half: no banks, plain
+//     self-attention; cond half: banks injected into every attn1).
+//  6. Per-frame VAE decode (handled by decode_image_outputs' AnimateDiff
+//     frame branch; decode_first_stage does the /0.18215 and the
+//     (x/2+0.5).clamp mapping).
+// The k-diffusion samplers/sigma machinery are deliberately bypassed: the
+// zero-SNR terminal alpha (exactly 0.0) is unrepresentable in sigma space
+// (see runtime/denoiser.hpp animate_anyone_scheduler).
+static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
+                                    const sd_img_gen_params_t* sd_img_gen_params,
+                                    GenerationRequest& request,
+                                    sd_image_t** images_out,
+                                    int* num_images_out) {
+    StableDiffusionGGML* sd = sd_ctx->sd;
+
+    if (sd->reference_net == nullptr || sd->pose_guider == nullptr) {
+        LOG_ERROR("AnimateAnyone generation requires --reference-net and --pose-guider");
+        return false;
+    }
+    if (sd_img_gen_params->ref_images_count < 1 || sd_img_gen_params->ref_images[0].data == nullptr) {
+        LOG_ERROR("AnimateAnyone generation requires a reference image (-r/--ref-image)");
+        return false;
+    }
+    std::vector<std::string> pose_files = aa_list_pose_files(sd_img_gen_params->pose_images_dir);
+    if (pose_files.empty()) {
+        LOG_ERROR("AnimateAnyone generation requires --pose-dir with at least one pose image");
+        return false;
+    }
+    if (request.width % 8 != 0 || request.height % 8 != 0) {
+        LOG_ERROR("AnimateAnyone width/height must be multiples of 8 (got %dx%d)", request.width, request.height);
+        return false;
+    }
+    if (request.batch_count > 1) {
+        LOG_WARN("AnimateAnyone generation ignores --batch-count > 1 (generating one result)");
+    }
+
+    // Frame count: vid_gen dispatch (generate_animatediff_video) sets
+    // animatediff_num_frames to the pose-file count (capped); plain img_gen
+    // generates a single frame from the first pose file.
+    int F = sd->animatediff_num_frames > 1 ? sd->animatediff_num_frames : 1;
+    if (F > (int)pose_files.size()) {
+        LOG_ERROR("AnimateAnyone: %d frames requested but only %zu pose images in '%s'",
+                  F, pose_files.size(), sd_img_gen_params->pose_images_dir);
+        return false;
+    }
+    if ((int)pose_files.size() > F) {
+        LOG_INFO("AnimateAnyone: using the first %d of %zu pose images", F, pose_files.size());
+    }
+
+    const int W  = request.width;
+    const int H  = request.height;
+    const int lw = W / 8;
+    const int lh = H / 8;
+
+    int steps = sd_img_gen_params->sample_params.sample_steps;
+    if (steps <= 0) {
+        steps = 25;
+    }
+    const float cfg_scale = request.guidance.txt_cfg;
+    const bool do_cfg     = cfg_scale > 1.0f;
+    LOG_INFO("AnimateAnyone: %dx%d, %d frame(s), %d steps, cfg %.2f, seed %" PRId64,
+             W, H, F, steps, cfg_scale, request.seed);
+
+    if (F > 1 && !sd->diffusion_model->is_flash_attention_enabled() &&
+        !sd_backend_is_cpu(sd->backend_for(SDBackendModule::DIFFUSION))) {
+        // Task 8 measurement: the non-flash F=8 cond graph materializes an
+        // ~8.6 GB QK^T score matrix in a single block, which no graph-cut
+        // budget can split. Warn instead of failing: bigger cards may fit.
+        LOG_WARN("AnimateAnyone with %d frames on GPU without flash attention needs a very large "
+                 "attention buffer (~8.6 GB at 512x512/F=8); pass --diffusion-fa if this OOMs",
+                 F);
+    }
+
+    // --- Inputs ---
+    // Pose frames: [0,1], NO [-1,1] rescale (Moore cond_image_processor
+    // do_normalize=False), full resolution, stacked on the frame axis (ne[3];
+    // the pose guider's convs treat it as a batch axis, exactly how the
+    // reference runs the guider once over the whole (1,3,F,H,W) clip).
+    sd::Tensor<float> pose_cond({W, H, 3, F});
+    for (int f = 0; f < F; ++f) {
+        sd::Tensor<float> pose = aa_load_image_tensor(pose_files[f], W, H, true);
+        if (pose.empty()) {
+            return false;
+        }
+        sd::ops::slice_assign(&pose_cond, 3, f, f + 1, pose);
+    }
+
+    // Reference image, twice: original resolution for the CLIP-vision path
+    // (the conditioner's PIL-exact bicubic resize to 224 wants the source
+    // pixels), target resolution for the VAE reference latents.
+    sd::Tensor<float> ref_full = sd_image_to_tensor(sd_img_gen_params->ref_images[0], -1, -1, true);
+    sd::Tensor<float> ref_vae  = sd_image_to_tensor(sd_img_gen_params->ref_images[0], W, H, true);
+    if (ref_full.empty() || ref_vae.empty()) {
+        LOG_ERROR("failed to convert the reference image");
+        return false;
+    }
+
+    int64_t t_prep = ggml_time_ms();
+
+    // --- 1. CLIP image embeds: cond from the reference image, uncond literal
+    // zeros (torch.zeros_like, NOT an empty-text embedding). ---
+    std::vector<sd::Tensor<float>> cond_ref_images;
+    cond_ref_images.push_back(std::move(ref_full));
+    ConditionerParams conditioner_params;
+    conditioner_params.ref_images = &cond_ref_images;
+    SDCondition clip_cond         = sd->cond_stage_model->get_learned_condition(sd->n_threads, conditioner_params);
+    sd->cond_stage_model->runner_done();
+    if (clip_cond.c_crossattn.empty()) {
+        LOG_ERROR("AnimateAnyone CLIP-vision conditioning failed");
+        return false;
+    }
+    sd::Tensor<float> clip_uncond({768, 1, 1});
+    clip_uncond.fill_(0.f);
+
+    // --- 2. Reference latents: VAE mean * 0.18215. ---
+    sd::Tensor<float> ref_latent = sd->encode_first_stage_mean(ref_vae);
+    if (ref_latent.empty()) {
+        LOG_ERROR("failed to VAE-encode the reference image");
+        return false;
+    }
+
+    // --- 3. Pose guider forward (once; timestep-independent). ---
+    sd::Tensor<float> pose_feature = sd->pose_guider->compute(sd->n_threads, pose_cond);
+    sd->pose_guider->runner_done();
+    if (pose_feature.empty()) {
+        LOG_ERROR("pose guider forward failed");
+        return false;
+    }
+
+    // --- 4. ReferenceNet forward once at t=0, CFG-doubled inputs (both ref
+    // latent rows identical, clip rows = [uncond zeros, cond]). Banks are
+    // reused unchanged across all denoising steps. ---
+    sd::Tensor<float> ref_latents_cfg2({lw, lh, 4, 2});
+    sd::ops::slice_assign(&ref_latents_cfg2, 3, 0, 1, ref_latent);
+    sd::ops::slice_assign(&ref_latents_cfg2, 3, 1, 2, ref_latent);
+    sd::Tensor<float> clip_embeds_cfg2({768, 1, 2});
+    sd::ops::slice_assign(&clip_embeds_cfg2, 2, 0, 1, clip_uncond);
+    sd::ops::slice_assign(&clip_embeds_cfg2, 2, 1, 2, clip_cond.c_crossattn.reshape({768, 1, 1}));
+    std::vector<sd::Tensor<float>> banks = sd->compute_reference_banks(ref_latents_cfg2, clip_embeds_cfg2);
+    sd->reference_net->runner_done();
+    if (banks.size() != 16) {
+        LOG_ERROR("reference bank capture failed (%zu/16 banks)", banks.size());
+        return false;
+    }
+    int64_t t_banks = ggml_time_ms();
+    LOG_INFO("conditioning + reference banks computed, taking %.2fs", (t_banks - t_prep) * 1.0f / 1000);
+
+    // --- 5. Trailing DDIM v-pred zero-SNR loop. ---
+    std::vector<float> alphas_cumprod(TIMESTEPS);
+    animate_anyone_scheduler::calculate_alphas_cumprod(alphas_cumprod.data());
+    std::vector<int> timesteps = animate_anyone_scheduler::trailing_timesteps(TIMESTEPS, steps);
+
+    // DDIM init_noise_sigma is 1.0: plain unit gaussian initial latents.
+    sd::Tensor<float> x({lw, lh, 4, F});
+    x = sd::Tensor<float>::randn_like(x, sd->rng);
+    if (const char* init_path = getenv("SDCPP_AA_DEBUG_INIT_LATENT")) {
+        // Debug-only: load a raw fp32 dump (numpy (1,4,F,H/8,W/8).tofile) as
+        // the initial latent, for step-by-step trajectory comparison against
+        // the PyTorch reference. F=1 only (flat layouts coincide at F=1).
+        FILE* fp = fopen(init_path, "rb");
+        if (fp == nullptr || F != 1 ||
+            fread(x.data(), sizeof(float), x.numel(), fp) != (size_t)x.numel()) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: failed to load '%s'", init_path);
+            if (fp) fclose(fp);
+            return false;
+        }
+        fclose(fp);
+        LOG_INFO("SDCPP_AA_DEBUG_INIT_LATENT: initial latent loaded from '%s'", init_path);
+    }
+
+    struct AARunnerDone {
+        GGMLRunner* runner;
+        ~AARunnerDone() { runner->runner_done(); }
+    } diffusion_done{sd->diffusion_model.get()};
+
+    int64_t last_step_ms = ggml_time_ms();
+    for (int i = 0; i < steps; ++i) {
+        if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+            LOG_ERROR("cancelling AnimateAnyone generation");
+            return false;
+        }
+        const int t = timesteps[i];
+        std::vector<float> t_vec(1, static_cast<float>(t));
+        sd::Tensor<float> timesteps_tensor = sd::Tensor<float>::from_vector(t_vec);
+
+        sd::Tensor<float> v_cond;
+        sd::Tensor<float> v_uncond;
+        for (int h = do_cfg ? 0 : 1; h < 2; ++h) {
+            UNetDiffusionExtra extra;
+            extra.num_video_frames = F;
+            extra.aa_banks         = (h == 0) ? nullptr : &banks;
+            extra.aa_is_uncond     = (h == 0);
+            extra.aa_pose_feature  = &pose_feature;
+            // F=1: skip the motion modules. They were trained on 24-frame
+            // windows and degenerate at a single frame - verified against the
+            // PyTorch reference (task 9): with motion active at F=1 BOTH this
+            // port and the reference pipeline fail to denoise identically
+            // (latent std grows monotonically, output is noise), while the
+            // spatial-only forward denoises normally. Video generation (F>1)
+            // keeps the motion modules.
+            extra.aa_spatial_only = (F == 1);
+
+            DiffusionParams params;
+            params.x         = &x;
+            params.timesteps = &timesteps_tensor;
+            params.context   = (h == 0) ? &clip_uncond : &clip_cond.c_crossattn;
+            params.extra     = extra;
+
+            sd::Tensor<float> out = sd->diffusion_model->compute(sd->n_threads, params);
+            if (out.empty()) {
+                LOG_ERROR("AnimateAnyone %s forward failed at step %d (t=%d)",
+                          h == 0 ? "uncond" : "cond", i + 1, t);
+                return false;
+            }
+            (h == 0 ? v_uncond : v_cond) = std::move(out);
+        }
+
+        sd::Tensor<float> v_pred = do_cfg
+                                       ? v_uncond + (v_cond - v_uncond) * cfg_scale
+                                       : std::move(v_cond);
+
+        // prev timestep on the trailing grid is t - 1000/steps; past the end
+        // there is no previous step and diffusers' set_alpha_to_one=True
+        // (default) substitutes final_alpha_cumprod = 1.0.
+        const int prev_t         = t - TIMESTEPS / steps;
+        const float alpha_prod_t = alphas_cumprod[t];
+        const float alpha_prev   = prev_t >= 0 ? alphas_cumprod[prev_t] : 1.0f;
+        if (getenv("SDCPP_AA_DEBUG_STATS") != nullptr) {
+            auto stats = [](const sd::Tensor<float>& tt, const char* name, int step, int t) {
+                double s = 0, s2 = 0;
+                for (int64_t k = 0; k < tt.numel(); ++k) {
+                    s += tt[k];
+                    s2 += (double)tt[k] * tt[k];
+                }
+                double mean = s / tt.numel();
+                double var  = s2 / tt.numel() - mean * mean;
+                LOG_INFO("AA step %d t=%d %s: mean %.5f std %.5f", step, t, name, mean, std::sqrt(std::max(var, 0.0)));
+            };
+            stats(x, "x", i, t);
+            stats(v_pred, "v", i, t);
+        }
+        x                        = animate_anyone_scheduler::ddim_v_pred_step(x, v_pred, alpha_prod_t, alpha_prev);
+
+        int64_t now = ggml_time_ms();
+        pretty_progress(i + 1, steps, (now - last_step_ms) / 1000.f);
+        last_step_ms = now;
+    }
+
+    // --- 6. Decode per frame. decode_image_outputs' AnimateDiff branch
+    // (animatediff_num_frames > 1 && shape[3] == n_frames) slices the frame
+    // axis and decodes one latent at a time; F=1 takes the plain-image path.
+    // Both go through decode_first_stage: latent / 0.18215 then the VAE's
+    // (x/2+0.5).clamp output mapping. ---
+    std::vector<sd::Tensor<float>> final_latents;
+    final_latents.push_back(std::move(x));
+    int num_images = 0;
+    auto result    = decode_image_outputs(sd_ctx, request, final_latents, &num_images);
+    if (result == nullptr) {
+        return false;
+    }
+    if (num_images_out != nullptr) {
+        *num_images_out = num_images;
+    }
+    if (images_out != nullptr) {
+        *images_out = result;
+    } else {
+        for (int i = 0; i < num_images; ++i) {
+            free(result[i].data);
+        }
+        free(result);
+    }
+    return true;
+}
+
 SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            const sd_img_gen_params_t* sd_img_gen_params,
                            sd_image_t** images_out,
@@ -5759,6 +6103,17 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
     sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
     apply_circular_axes_to_diffusion(sd_ctx, sd_img_gen_params->circular_x, sd_img_gen_params->circular_y);
+
+    // AnimateAnyone has its own pipeline order and its own alphas-space DDIM
+    // stepper (zero-SNR terminal alpha is unrepresentable in sigma space), so
+    // it branches off before the SamplePlan/k-diffusion machinery.
+    if (sd_version_is_animate_anyone(sd_ctx->sd->version)) {
+        bool aa_ok = generate_animate_anyone(sd_ctx, sd_img_gen_params, request, images_out, num_images_out);
+        if (aa_ok) {
+            LOG_INFO("generate_image completed in %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
+        }
+        return aa_ok;
+    }
 
     const RefImageParams ref_image_params = sd_ctx->sd->resolve_ref_image_params(sd_img_gen_params->ref_image_args);
 
@@ -6929,7 +7284,28 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
                                        sd_image_t** frames_out,
                                        int* num_frames_out) {
     int n_frames = sd_vid_gen_params->video_frames;
-    if (n_frames < 1) {
+    if (sd_version_is_animate_anyone(sd_ctx->sd->version)) {
+        // AnimateAnyone vid_gen: F is the number of pose frames in --pose-dir
+        // (one generated frame per pose image), capped at 24 - the reference
+        // context window (context_frames=24); the sliding-window path for
+        // longer clips is task 10.
+        std::vector<std::string> pose_files = aa_list_pose_files(sd_vid_gen_params->pose_images_dir);
+        if (pose_files.empty()) {
+            LOG_ERROR("AnimateAnyone vid_gen requires --pose-dir with at least one pose image");
+            return false;
+        }
+        n_frames = (int)pose_files.size();
+        if (n_frames > 24) {
+            LOG_WARN("AnimateAnyone is currently capped at 24 frames (reference context window; "
+                     "longer clips need the sliding-window path); using the first 24 of %zu pose images",
+                     pose_files.size());
+            n_frames = 24;
+        }
+        if (sd_vid_gen_params->video_frames > 1 && sd_vid_gen_params->video_frames != n_frames) {
+            LOG_WARN("AnimateAnyone ignores --video-frames (%d); frame count follows --pose-dir (%d)",
+                     sd_vid_gen_params->video_frames, n_frames);
+        }
+    } else if (n_frames < 1) {
         LOG_ERROR("AnimateDiff: --video-frames must be >= 1");
         return false;
     }
@@ -6959,6 +7335,13 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
     img_gen_params.qwen_image_layers = 0;
     img_gen_params.circular_x        = sd_vid_gen_params->circular_x;
     img_gen_params.circular_y        = sd_vid_gen_params->circular_y;
+    if (sd_version_is_animate_anyone(sd_ctx->sd->version)) {
+        // AnimateAnyone needs its reference image and pose dir forwarded into
+        // the img_gen params this dispatch reuses.
+        img_gen_params.ref_images       = sd_vid_gen_params->ref_images;
+        img_gen_params.ref_images_count = sd_vid_gen_params->ref_images_count;
+        img_gen_params.pose_images_dir  = sd_vid_gen_params->pose_images_dir;
+    }
 
     sd_ctx->sd->animatediff_num_frames = n_frames;
     bool ok                            = generate_image(sd_ctx, &img_gen_params, frames_out, num_frames_out);

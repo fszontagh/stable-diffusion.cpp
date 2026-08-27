@@ -259,6 +259,15 @@ bool ModelLoader::init_from_file(const std::string& file_path, const std::string
 
 void ModelLoader::convert_tensors_name() {
     SDVersion version = (version_ == VERSION_COUNT) ? get_sd_version() : version_;
+    // Cache the detected version: conversion rewrites tensor names (e.g. a
+    // diffusers-format standalone UNet's "model.diffusion_model.down_blocks."
+    // becomes CompVis "model.diffusion_model.input_blocks."), which can erase
+    // the very naming signature get_sd_version() detected the version from -
+    // a post-conversion re-detection would fail (observed with AnimateAnyone's
+    // denoising_unet.pth: SD1 inferred pre-conversion, VERSION_COUNT after).
+    if (version_ == VERSION_COUNT && version != VERSION_COUNT) {
+        version_ = version;
+    }
     String2TensorStorage new_map;
 
     for (auto& [_, tensor_storage] : tensor_storage_map) {
@@ -448,6 +457,14 @@ bool ModelLoader::init_from_diffusers_file(const std::string& file_path, const s
 }
 
 SDVersion ModelLoader::get_sd_version() {
+    // A version already established - passed explicitly to
+    // init_from_file_and_convert_name(), or cached by convert_tensors_name()
+    // before conversion rewrote the naming signature detection depends on -
+    // is authoritative; re-detection on a converted map can fail (see
+    // convert_tensors_name).
+    if (version_ != VERSION_COUNT) {
+        return version_;
+    }
     TensorStorage token_embedding_weight, input_block_weight, context_ebedding_weight;
 
     bool has_multiple_encoders = false;

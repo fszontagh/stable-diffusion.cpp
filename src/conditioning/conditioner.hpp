@@ -10,6 +10,7 @@
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
 #include "model/diffusion/model.hpp"
+#include "model/te/aa_clip_preprocess.hpp"
 #include "model/te/clip.hpp"
 #include "model/te/llm.hpp"
 #include "model/te/t5.hpp"
@@ -645,12 +646,18 @@ struct AnimateAnyoneVisionConditioner : public Conditioner {
         SDCondition cond;
         const int64_t projection_dim = 768;
         if (conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
-            // Cond half: encode the reference image. clip_preprocess resizes
-            // and normalizes with CLIP's mean/std; the reference pipeline's
-            // exact PIL-bicubic resample is validated separately by aa_test
-            // (task 4) - full generation wiring/preprocessing exactness is
-            // task 9's concern.
-            sd::Tensor<float> pixel_values = clip_preprocess(conditioner_params.ref_images->front(), 224, 224);
+            // Cond half: encode the reference image with the PIL-exact
+            // bicubic preprocessing chain (aa_clip_preprocess.hpp, validated
+            // against the reference pipeline's own pixel_values by aa_test's
+            // clip-embeds mode, task 4). The shared clip_preprocess() would
+            // resize nearest-neighbor with an aspect-preserving crop, which
+            // misses the fixture tolerance by orders of magnitude. Callers
+            // pass the reference image at its ORIGINAL resolution, scaled to
+            // [0,1] (sd_image_to_tensor's default); aa_clip_preprocess wants
+            // raw [0,255] byte values so its per-pass uint8 rounding matches
+            // Pillow, hence the *255 here.
+            sd::Tensor<float> pixel_values = AnimateAnyone::aa_clip_preprocess(
+                conditioner_params.ref_images->front() * 255.0f, 224);
             sd::Tensor<float> embed        = vision->compute(n_threads, pixel_values, /*return_pooled=*/true, /*clip_skip=*/-1);
             if (embed.empty()) {
                 LOG_ERROR("AnimateAnyone CLIP-vision encode failed");

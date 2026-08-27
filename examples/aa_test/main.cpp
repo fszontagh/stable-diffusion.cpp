@@ -27,6 +27,7 @@
 #include "core/util.h"
 #include "model/adapter/pose_guider.hpp"
 #include "model/diffusion/unet.hpp"
+#include "model/te/aa_clip_preprocess.hpp"
 #include "model/te/clip.hpp"
 #include "model/vae/auto_encoder_kl.hpp"
 
@@ -436,155 +437,11 @@ struct ClipVisionRunner : public GGMLRunner {
     }
 };
 
-// PIL-matching bicubic resample weight. Pillow's BICUBIC filter (Pillow/src/libImaging/Resample.c,
-// `bicubic_filter`) uses the a=-0.5 Catmull-Rom-family cubic convolution kernel, NOT the a=-0.75
-// coefficient PyTorch (and this fork's core/tensor.hpp cubic_interpolate_weight, whose comment says
-// "Match PyTorch bicubic interpolation") uses. The two only differ in that one constant, but on a
-// 512->224 (2.3x) downsample the difference is large enough (measured: pixel-level rel L2 ~0.28%,
-// which the CLIP vision tower's 24 transformer layers amplify to ~9.7% on the pooled/projected
-// embedding) to blow the fixture's 1e-3 tolerance. This local helper reimplements the fork's own
-// antialias-aware separable-convolution resize (tensor.hpp's make_interpolate_contributors /
-// interpolate_2d_filter) with a=-0.5 instead, to match what the reference pipeline's PIL resize
-// actually computes. Kept local to aa_test rather than changing core/tensor.hpp's InterpolateMode::
-// Bicubic (which IP-Adapter/PhotoMaker/SVD/etc. depend on for its current, deliberately
-// PyTorch-matching, behavior).
-static double aa_pil_bicubic_weight(double x) {
-    constexpr double a = -0.5;
-    x                  = std::fabs(x);
-    if (x <= 1.0) {
-        return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
-    }
-    if (x < 2.0) {
-        return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a;
-    }
-    return 0.0;
-}
-
-struct AaResizeContributor {
-    int64_t index;
-    double weight;
-};
-
-// Antialias-widened (per tensor.hpp's antialias=true convention: filter support scales with the
-// downsample ratio) contributor list per output index, for one axis.
-static std::vector<std::vector<AaResizeContributor>> aa_make_resize_contributors(int64_t in_size, int64_t out_size) {
-    std::vector<std::vector<AaResizeContributor>> contributors(static_cast<size_t>(out_size));
-    const double scale        = static_cast<double>(in_size) / static_cast<double>(out_size);
-    const double filter_scale = std::max(1.0, scale);
-    const double support       = 2.0 * filter_scale;
-
-    for (int64_t out = 0; out < out_size; ++out) {
-        const double center = (static_cast<double>(out) + 0.5) * scale - 0.5;
-        int64_t start        = static_cast<int64_t>(std::ceil(center - support));
-        int64_t end           = static_cast<int64_t>(std::floor(center + support));
-        double weight_sum     = 0.0;
-        auto& axis_contribs   = contributors[static_cast<size_t>(out)];
-        for (int64_t in = start; in <= end; ++in) {
-            double weight = aa_pil_bicubic_weight((center - static_cast<double>(in)) / filter_scale);
-            if (weight == 0.0) {
-                continue;
-            }
-            int64_t clamped = std::min(std::max<int64_t>(in, 0), in_size - 1);
-            axis_contribs.push_back({clamped, weight});
-            weight_sum += weight;
-        }
-        if (std::fabs(weight_sum) > 1e-12) {
-            for (auto& c : axis_contribs) {
-                c.weight /= weight_sum;
-            }
-        }
-    }
-    return contributors;
-}
-
-// Separable two-pass resize of `image` ([W,H,C,1], values in [0,255]) to `size`x`size`,
-// matching PIL's bicubic (a=-0.5) antialiased downsampling.
-//
-// Pillow's C resample implementation (libImaging/Resample.c) does the horizontal and
-// vertical passes as two *separate* 8-bit images: the horizontal pass's output is
-// rounded/clipped to a uint8 image before the vertical pass runs on it, and the
-// vertical pass's output is likewise rounded/clipped to uint8 at the end. A first
-// version of this helper worked entirely in un-quantized float (resizing the [0,1]-
-// scaled tensor directly, one pass feeding the other with no rounding) and, despite
-// using the correct a=-0.5 kernel, still landed at ~0.5% relative L2 on the projected
-// CLIP embedding (5x over the 1e-3 fixture tolerance) - skipping the two intermediate
-// uint8 roundings turned out to matter enough to fail the check. Reproducing that
-// quantization (round-half-away-from-zero + clip to [0,255] after EACH pass, operating
-// on [0,255]-scale pixel values, not pre-divided-by-255 float) brought the measured
-// pixel-level rel L2 down another ~10x and the projected-embedding rel L2 comfortably
-// under tolerance. Kept local to aa_test (not core/tensor.hpp's InterpolateMode::
-// Bicubic) for the same reason as aa_pil_bicubic_weight above.
-static float aa_round_clip_u8(double v) {
-    // Round-half-to-even (std::nearbyint under the default FE_TONEAREST rounding
-    // mode), not round-half-up: empirically matches Pillow's actual output one tie
-    // case closer on this fixture (4 differing pixels out of 150528 vs 7, all off by
-    // exactly 1/255) than floor(v+0.5) round-half-up.
-    double rounded = std::nearbyint(v);
-    return static_cast<float>(std::min(std::max(rounded, 0.0), 255.0));
-}
-
-static sd::Tensor<float> aa_pil_bicubic_resize(const sd::Tensor<float>& image_0_255, int size) {
-    int64_t W = image_0_255.shape()[0], H = image_0_255.shape()[1], C = image_0_255.shape()[2];
-    auto row_contribs = aa_make_resize_contributors(W, size);  // horizontal axis
-    auto col_contribs = aa_make_resize_contributors(H, size);  // vertical axis
-
-    // Horizontal pass, then round/clip to uint8-equivalent (matches Pillow's
-    // intermediate 8-bit image between the two passes).
-    sd::Tensor<float> tmp({size, H, C, 1});
-    for (int64_t y = 0; y < H; ++y) {
-        for (int64_t c = 0; c < C; ++c) {
-            for (int64_t ox = 0; ox < size; ++ox) {
-                double acc = 0.0;
-                for (const auto& con : row_contribs[static_cast<size_t>(ox)]) {
-                    acc += con.weight * image_0_255.index(con.index, y, c, 0);
-                }
-                tmp.index(ox, y, c, 0) = aa_round_clip_u8(acc);
-            }
-        }
-    }
-
-    // Vertical pass, then round/clip to uint8-equivalent (Pillow's final output image
-    // is itself uint8).
-    sd::Tensor<float> out({size, size, C, 1});
-    for (int64_t oy = 0; oy < size; ++oy) {
-        for (int64_t c = 0; c < C; ++c) {
-            for (int64_t ox = 0; ox < size; ++ox) {
-                double acc = 0.0;
-                for (const auto& con : col_contribs[static_cast<size_t>(oy)]) {
-                    acc += con.weight * tmp.index(ox, con.index, c, 0);
-                }
-                out.index(ox, oy, c, 0) = aa_round_clip_u8(acc);
-            }
-        }
-    }
-    return out;
-}
-
-// CLIP-preprocesses `image` ([W,H,3,1], values in [0,255]) to a `size`x`size` tile
-// with CLIP's mean/std normalization, for the AnimateAnyone CLIP-vision-only path.
-//
-// Deliberately does NOT reuse the fork's shared clip_preprocess() (core/util.cpp).
-// That helper resizes with InterpolateMode::Nearest (its interpolate() call omits
-// the mode argument, which defaults to Nearest - see core/tensor.hpp:1226) and does
-// an aspect-ratio-preserving resize + center-crop. The reference pipeline instead
-// does `ref_image.resize((224,224))` (a plain PIL resize, default resample bicubic
-// in modern Pillow, that squashes to the target size ignoring aspect ratio) and then
-// feeds that into `CLIPImageProcessor()` defaults, whose own resize/crop become a
-// no-op once the image is already exactly target-sized. Nearest-neighbor 512->224
-// downsampling would not match a bicubic reference within the 1e-3 rel-L2 tolerance
-// at all, and even the fork's own antialiased Bicubic mode (PyTorch a=-0.75
-// convention, no intermediate 8-bit rounding) misses tolerance - see
-// aa_pil_bicubic_resize above for both fixes. The shared clip_preprocess() is left
-// untouched so IP-Adapter/PhotoMaker/SVD callers keep their exact prior behavior.
-static sd::Tensor<float> aa_clip_preprocess(const sd::Tensor<float>& image_0_255, int size) {
-    sd::Tensor<float> resized_0_255 = aa_pil_bicubic_resize(image_0_255, size);
-    sd::Tensor<float> scaled        = resized_0_255 / 255.0f;  // [0,255] -> [0,1]
-
-    // Same constants as core/util.cpp's clip_preprocess (CLIP's fixed mean/std).
-    sd::Tensor<float> mean({1, 1, 3, 1}, {0.48145466f, 0.4578275f, 0.40821073f});
-    sd::Tensor<float> std_dev({1, 1, 3, 1}, {0.26862954f, 0.26130258f, 0.27577711f});
-    return (scaled - mean) / std_dev;
-}
+// The PIL-exact bicubic (a=-0.5, per-pass uint8 rounding) CLIP preprocessing
+// chain was promoted to src/model/te/aa_clip_preprocess.hpp in task 9 so the
+// generation-time AnimateAnyoneVisionConditioner shares it; this test keeps
+// validating it against the reference pipeline's own pixel_values below.
+using AnimateAnyone::aa_clip_preprocess;
 
 static int run_clip_embeds_mode(int argc, char** argv) {
     std::string clip_vision_path = aa_weights_root() + "/image_encoder/pytorch_model.bin";
@@ -1539,20 +1396,20 @@ static int run_unet_step_mode(int argc, char** argv, int video_length, const cha
         return 1;
     }
 
-    ggml_backend_t cpu_backend = aa_test_pick_backend();
-    if (cpu_backend == nullptr) {
+    ggml_backend_t compute_backend = aa_test_pick_backend();
+    if (compute_backend == nullptr) {
         fprintf(stderr, "error: failed to init a compute backend\n");
         return 1;
     }
     printf("compute backend: %s%s\n",
-          ggml_backend_name(cpu_backend),
-          sd_backend_is_cpu(cpu_backend) ? " (CPU)" : " (GPU)");
+          ggml_backend_name(compute_backend),
+          sd_backend_is_cpu(compute_backend) ? " (CPU)" : " (GPU)");
 
     printf("conv precision: %s\n", force_conv_f32 ? "f32" : "f16");
-    UNetModelRunner runner(cpu_backend, unet_loader.get_tensor_storage_map(), "model.diffusion_model",
+    UNetModelRunner runner(compute_backend, unet_loader.get_tensor_storage_map(), "model.diffusion_model",
                            VERSION_ANIMATE_ANYONE, unet_manager,
                            /*reference_headless=*/false, force_conv_f32);
-    if (!sd_backend_is_cpu(cpu_backend) && video_length > 1) {
+    if (!sd_backend_is_cpu(compute_backend) && video_length > 1) {
         // At F=8 the COND graph's largest spatial block (input_blocks.1,
         // 320ch/64x64=4096 tokens, bank-doubled K=8192, 8 frames) materializes
         // a naive (non-flash) QK^T score matrix of ~4096*8192*8heads*8frames -
@@ -1593,7 +1450,7 @@ static int run_unet_step_mode(int argc, char** argv, int video_length, const cha
     }
     if (!unet_manager->register_param_tensors("denoising_unet", unet_tensors,
                                               ModelManager::ResidencyMode::ParamBackend,
-                                              cpu_backend, cpu_backend) ||
+                                              compute_backend, compute_backend) ||
         !unet_manager->validate_registered_tensors()) {
         fprintf(stderr, "error: failed to register denoising unet tensors with the model manager\n");
         return 1;
