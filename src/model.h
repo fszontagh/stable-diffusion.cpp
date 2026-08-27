@@ -57,12 +57,18 @@ enum SDVersion {
     VERSION_SEFI_IMAGE,
     VERSION_KREA2,
     VERSION_MAGE_FLOW,
+    VERSION_ANIMATE_ANYONE,
     VERSION_ESRGAN,
     VERSION_COUNT,
 };
 
+static inline bool sd_version_is_animate_anyone(SDVersion version) {
+    return version == VERSION_ANIMATE_ANYONE;
+}
+
 static inline bool sd_version_is_sd1(SDVersion version) {
-    if (version == VERSION_SD1 || version == VERSION_SD1_INPAINT || version == VERSION_SD1_PIX2PIX || version == VERSION_SD1_TINY_UNET || version == VERSION_SDXS_512_DS) {
+    if (version == VERSION_SD1 || version == VERSION_SD1_INPAINT || version == VERSION_SD1_PIX2PIX || version == VERSION_SD1_TINY_UNET || version == VERSION_SDXS_512_DS ||
+        sd_version_is_animate_anyone(version)) {
         return true;
     }
     return false;

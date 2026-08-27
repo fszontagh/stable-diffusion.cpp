@@ -1235,6 +1235,7 @@ std::vector<std::string> cond_stage_model_prefix_vec = {
 
 std::vector<std::string> diffuison_model_prefix_vec = {
     "model.diffusion_model.",
+    "model.reference_net.",
 };
 
 std::vector<std::string> first_stage_model_prefix_vec = {

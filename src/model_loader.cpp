@@ -554,7 +554,11 @@ SDVersion ModelLoader::get_sd_version() {
             has_img_emb = true;
         }
         if (tensor_storage.name.find("model.diffusion_model.input_blocks.") != std::string::npos ||
-            tensor_storage.name.find("unet.down_blocks.") != std::string::npos) {
+            tensor_storage.name.find("unet.down_blocks.") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.down_blocks.") != std::string::npos) {
+            // Diffusers-format standalone UNets (e.g. AnimateAnyone's denoising_unet.pth /
+            // reference_unet.pth) keep their `down_blocks.` naming even when loaded under the
+            // `model.diffusion_model.` prefix (no name-conversion pass has run yet at this point).
             is_unet = true;
             if (has_multiple_encoders) {
                 is_xl = true;
@@ -679,6 +683,12 @@ SDVersion ModelLoader::get_sd_version() {
             return has_attn_1024 ? VERSION_SDXS_09 : VERSION_SD2_TINY_UNET;
         }
         return VERSION_SD2;
+    }
+    if (is_unet && !is_xl) {
+        // No CLIP text encoder tensors were found alongside the UNet (e.g. a standalone
+        // diffusion-model-only load such as AnimateAnyone's denoising_unet.pth/reference_unet.pth).
+        // Default to the SD1 UNet family, its natural signature absent a distinguishing encoder.
+        return VERSION_SD1;
     }
     return VERSION_COUNT;
 }

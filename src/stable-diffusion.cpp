@@ -73,7 +73,7 @@ const char* sd_vae_format_name(enum sd_vae_format_t format);
 static SDVersion sd_vae_format_to_version(enum sd_vae_format_t format, SDVersion fallback);
 
 static bool sd_version_supports_animatediff(SDVersion version) {
-    return version == VERSION_SD1 || version == VERSION_SD1_INPAINT || version == VERSION_SD1_PIX2PIX;
+    return version == VERSION_SD1 || version == VERSION_SD1_INPAINT || version == VERSION_SD1_PIX2PIX || sd_version_is_animate_anyone(version);
 }
 
 const char* model_version_to_str[] = {
@@ -123,6 +123,7 @@ const char* model_version_to_str[] = {
     "SeFi-Image",
     "Krea2",
     "Mage Flow",
+    "Animate Anyone",
     "ESRGAN",
 };
 
@@ -906,6 +907,12 @@ public:
             return false;
         } else {
             LOG_INFO("Version: %s ", model_version_to_str[version]);
+        }
+
+        if (sd_version_is_sd1(version) && !sd_version_is_animate_anyone(version) &&
+            sd_ctx_params->reference_net_path != nullptr && strlen(sd_ctx_params->reference_net_path) > 0) {
+            version = VERSION_ANIMATE_ANYONE;
+            LOG_INFO("reference_net_path set, promoting detected version to %s", model_version_to_str[version]);
         }
 
         if (auto_fit_enabled) {
@@ -3591,6 +3598,9 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "diffusion_model_path: %s\n"
              "high_noise_diffusion_model_path: %s\n"
              "uncond_diffusion_model_path: %s\n"
+             "reference_net_path: %s\n"
+             "pose_guider_path: %s\n"
+             "ref_pose_image_path: %s\n"
              "embeddings_connectors_path: %s\n"
              "vae_path: %s\n"
              "audio_vae_path: %s\n"
@@ -3625,6 +3635,9 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->diffusion_model_path),
              SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path),
              SAFE_STR(sd_ctx_params->uncond_diffusion_model_path),
+             SAFE_STR(sd_ctx_params->reference_net_path),
+             SAFE_STR(sd_ctx_params->pose_guider_path),
+             SAFE_STR(sd_ctx_params->ref_pose_image_path),
              SAFE_STR(sd_ctx_params->embeddings_connectors_path),
              SAFE_STR(sd_ctx_params->vae_path),
              SAFE_STR(sd_ctx_params->audio_vae_path),

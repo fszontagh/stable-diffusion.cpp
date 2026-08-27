@@ -393,6 +393,21 @@ ArgOptions SDContextParams::get_options() {
          0,
          &uncond_diffusion_model_path},
         {"",
+         "--reference-net",
+         "path to the AnimateAnyone reference net UNet",
+         0,
+         &reference_net_path},
+        {"",
+         "--pose-guider",
+         "path to the AnimateAnyone pose guider weights",
+         0,
+         &pose_guider_path},
+        {"",
+         "--ref-pose",
+         "path to the AnimateAnyone reference pose image",
+         0,
+         &ref_pose_image_path},
+        {"",
          "--embeddings-connectors",
          "path to LTXAV embeddings connectors",
          0,
@@ -813,6 +828,9 @@ std::string SDContextParams::to_string() const {
         << "  diffusion_model_path: \"" << diffusion_model_path << "\",\n"
         << "  high_noise_diffusion_model_path: \"" << high_noise_diffusion_model_path << "\",\n"
         << "  uncond_diffusion_model_path: \"" << uncond_diffusion_model_path << "\",\n"
+        << "  reference_net_path: \"" << reference_net_path << "\",\n"
+        << "  pose_guider_path: \"" << pose_guider_path << "\",\n"
+        << "  ref_pose_image_path: \"" << ref_pose_image_path << "\",\n"
         << "  embeddings_connectors_path: \"" << embeddings_connectors_path << "\",\n"
         << "  vae_path: \"" << vae_path << "\",\n"
         << "  vae_format: \"" << vae_format << "\",\n"
@@ -876,6 +894,9 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.diffusion_model_path            = diffusion_model_path.c_str();
     sd_ctx_params.high_noise_diffusion_model_path = high_noise_diffusion_model_path.c_str();
     sd_ctx_params.uncond_diffusion_model_path     = uncond_diffusion_model_path.c_str();
+    sd_ctx_params.reference_net_path              = reference_net_path.c_str();
+    sd_ctx_params.pose_guider_path                = pose_guider_path.c_str();
+    sd_ctx_params.ref_pose_image_path             = ref_pose_image_path.c_str();
     sd_ctx_params.embeddings_connectors_path      = embeddings_connectors_path.c_str();
     sd_ctx_params.vae_path                        = vae_path.c_str();
     sd_ctx_params.audio_vae_path                  = audio_vae_path.c_str();
@@ -984,6 +1005,13 @@ ArgOptions SDGenerationParams::get_options() {
          "such as 00.png, 01.png, ... etc.",
          0,
          &control_video_path},
+        {"",
+         "--pose-dir",
+         "path to AnimateAnyone pose guider input frames, It must be a directory path. The pose frames inside should be "
+         "stored as images in lexicographical (character) order. For example, if the pose dir is `poses`, the directory "
+         "contains images such as 00.png, 01.png, ... etc.",
+         0,
+         &pose_images_dir},
         {"",
          "--pm-id-images-dir",
          "path to PHOTOMAKER input id images dir",
@@ -2595,6 +2623,7 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
+    params.pose_images_dir           = pose_images_dir.empty() ? nullptr : pose_images_dir.c_str();
     return params;
 }
 
@@ -2697,6 +2726,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
+    params.pose_images_dir           = pose_images_dir.empty() ? nullptr : pose_images_dir.c_str();
     return params;
 }
 
@@ -2753,6 +2783,7 @@ std::string SDGenerationParams::to_string() const {
         << "  ref_video_audio_paths: " << vec_str_to_string(ref_video_audio_paths) << ",\n"
         << "  ref_audio_paths: " << vec_str_to_string(ref_audio_paths) << ",\n"
         << "  control_video_path: \"" << control_video_path << "\",\n"
+        << "  pose_images_dir: \"" << pose_images_dir << "\",\n"
         << "  auto_resize_ref_image: " << (auto_resize_ref_image ? "true" : "false") << ",\n"
         << "  increase_ref_index: " << (increase_ref_index ? "true" : "false") << ",\n"
         << "  pm_id_images_dir: \"" << pm_id_images_dir << "\",\n"

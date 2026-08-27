@@ -200,6 +200,9 @@ typedef struct {
     const char* diffusion_model_path;
     const char* high_noise_diffusion_model_path;
     const char* uncond_diffusion_model_path;
+    const char* reference_net_path;
+    const char* pose_guider_path;
+    const char* ref_pose_image_path;
     const char* embeddings_connectors_path;
     const char* vae_path;
     const char* audio_vae_path;
@@ -398,6 +401,7 @@ typedef struct {
     int qwen_image_layers;
     bool circular_x;
     bool circular_y;
+    const char* pose_images_dir;
 } sd_img_gen_params_t;
 
 typedef struct {
@@ -431,6 +435,7 @@ typedef struct {
     sd_hires_params_t hires;
     bool circular_x;
     bool circular_y;
+    const char* pose_images_dir;
 } sd_vid_gen_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

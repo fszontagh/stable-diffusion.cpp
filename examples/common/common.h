@@ -126,6 +126,9 @@ struct SDContextParams {
     std::string diffusion_model_path;
     std::string high_noise_diffusion_model_path;
     std::string uncond_diffusion_model_path;
+    std::string reference_net_path;
+    std::string pose_guider_path;
+    std::string ref_pose_image_path;
     std::string embeddings_connectors_path;
     std::string vae_path;
     std::string vae_format = "auto";
@@ -216,6 +219,7 @@ struct SDGenerationParams {
     std::vector<std::string> ref_video_audio_paths;
     std::vector<std::string> ref_audio_paths;
     std::string control_video_path;
+    std::string pose_images_dir;
 
     sd_sample_params_t sample_params;
     sd_sample_params_t high_noise_sample_params;
