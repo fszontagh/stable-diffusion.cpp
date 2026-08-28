@@ -35,9 +35,11 @@ std::u32string unicode_value_to_utf32(int unicode_value);
 sd_image_t tensor_to_sd_image(const sd::Tensor<float>& tensor, int frame_index = 0);
 
 sd::Tensor<float> sd_image_to_tensor(sd_image_t image,
-                                     int target_width  = -1,
-                                     int target_height = -1,
-                                     bool scale        = true);
+                                     int target_width               = -1,
+                                     int target_height               = -1,
+                                     bool scale                      = true,
+                                     sd::ops::InterpolateMode resize_mode = sd::ops::InterpolateMode::Nearest,
+                                     bool resize_antialias           = false);
 
 sd::Tensor<float> clip_preprocess(const sd::Tensor<float>& image, int target_width, int target_height);
 

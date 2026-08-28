@@ -5890,7 +5890,15 @@ static void aa_average_by_counter(sd::Tensor<float>* acc, const std::vector<floa
 }
 
 // Loads an image file as an fp32 tensor [W,H,3,1]. scale=true -> [0,1].
-// target_w/target_h > 0 resizes (sd_image_to_tensor's resize).
+// target_w/target_h > 0 resizes (sd_image_to_tensor's resize). Defaults the
+// resize to Lanczos+antialias, matching Moore's cond_image_processor
+// (VaeImageProcessor, resample="lanczos" by default) - the plain-Nearest
+// default sd_image_to_tensor() otherwise ships with was never exercised by
+// the aa_test fixtures (whose pose.png is already exactly the fixture's
+// target resolution, so the resize is always a no-op there) and produced a
+// large real-world divergence once a genuinely differently-sized pose image
+// forced an actual resize (found via task 11's per-step trajectory
+// bisection: see docs/animate_anyone.md's parity section).
 static sd::Tensor<float> aa_load_image_tensor(const std::string& path, int target_w, int target_h, bool scale) {
     int width = 0, height = 0, channels_in_file = 0;
     unsigned char* pixels = stbi_load(path.c_str(), &width, &height, &channels_in_file, 3);
@@ -5899,7 +5907,8 @@ static sd::Tensor<float> aa_load_image_tensor(const std::string& path, int targe
         return {};
     }
     sd_image_t image{static_cast<uint32_t>(width), static_cast<uint32_t>(height), 3, pixels};
-    sd::Tensor<float> tensor = sd_image_to_tensor(image, target_w, target_h, scale);
+    sd::Tensor<float> tensor = sd_image_to_tensor(image, target_w, target_h, scale,
+                                                  sd::ops::InterpolateMode::Lanczos, /*resize_antialias=*/true);
     free(pixels);
     return tensor;
 }
@@ -6034,6 +6043,70 @@ static bool aa_load_debug_init_latent(const std::string& path, sd::Tensor<float>
     return true;
 }
 
+// Debug-only: writes `t` (shape [W,H,C,F]) as a little-endian float32 .npy
+// with shape (1,C,F,H,W) - the inverse re-stride of
+// aa_load_debug_init_latent()'s .npy branch (generalized from a hardcoded
+// C=4 to an arbitrary channel count so it can also dump the pose-guider
+// output, C=320), so a value written here reads back identically via
+// np.load() on the Python side (or via this port's own loader). Used by
+// SDCPP_AA_DEBUG_STEP_LATENTS to dump the per-step trajectory (v-pred model
+// output and post-DDIM-step latents) and, at the top of the pipeline, the
+// pose-guider output, for divergence bisection against the PyTorch
+// reference.
+static bool aa_save_debug_npy(const std::string& path, const sd::Tensor<float>& t, int W, int H, int C, int F) {
+    std::error_code ec;
+    std::filesystem::path p(path);
+    if (!p.parent_path().empty()) {
+        std::filesystem::create_directories(p.parent_path(), ec);
+    }
+    FILE* fp = fopen(path.c_str(), "wb");
+    if (fp == nullptr) {
+        LOG_ERROR("SDCPP_AA_DEBUG_STEP_LATENTS: failed to open '%s' for writing", path.c_str());
+        return false;
+    }
+    struct FileCloser {
+        FILE* fp;
+        ~FileCloser() { fclose(fp); }
+    } closer{fp};
+
+    char header[128];
+    int header_body_len = snprintf(header, sizeof(header),
+                                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1, %d, %d, %d, %d), }",
+                                    C, F, H, W);
+    // Pad with spaces + trailing '\n' so magic(6)+ver(2)+len(2)+header is a
+    // multiple of 64 bytes, as numpy's format spec requires.
+    int prefix_len   = 6 + 2 + 2;
+    int total_before_pad = prefix_len + header_body_len + 1 /*\n*/;
+    int pad = (64 - (total_before_pad % 64)) % 64;
+    std::string header_str(header, header_body_len);
+    header_str.append(static_cast<size_t>(pad), ' ');
+    header_str.push_back('\n');
+    uint16_t header_len = static_cast<uint16_t>(header_str.size());
+
+    fwrite("\x93NUMPY", 1, 6, fp);
+    unsigned char ver[2] = {1, 0};
+    fwrite(ver, 1, 2, fp);
+    fwrite(&header_len, sizeof(header_len), 1, fp);
+    fwrite(header_str.data(), 1, header_str.size(), fp);
+
+    std::vector<float> raw(static_cast<size_t>(C) * F * H * W);
+    for (int c = 0; c < C; ++c) {
+        for (int f = 0; f < F; ++f) {
+            for (int h = 0; h < H; ++h) {
+                for (int w = 0; w < W; ++w) {
+                    size_t raw_idx = (((static_cast<size_t>(c) * F + f) * H + h) * W + w);
+                    raw[raw_idx]   = t.index(w, h, c, f);
+                }
+            }
+        }
+    }
+    bool ok = fwrite(raw.data(), sizeof(float), raw.size(), fp) == raw.size();
+    if (!ok) {
+        LOG_ERROR("SDCPP_AA_DEBUG_STEP_LATENTS: failed to write payload to '%s'", path.c_str());
+    }
+    return ok;
+}
+
 // AnimateAnyone end-to-end generation (P-map section 5, pose2img/pose2vid):
 //  1. CLIP image embeds of the reference image (cond) + literal-zero uncond.
 //  2. Reference latents: VAE posterior MEAN * 0.18215.
@@ -6144,9 +6217,16 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
 
     // Reference image, twice: original resolution for the CLIP-vision path
     // (the conditioner's PIL-exact bicubic resize to 224 wants the source
-    // pixels), target resolution for the VAE reference latents.
+    // pixels), target resolution for the VAE reference latents. The VAE path
+    // resize must match Moore's ref_image_processor (VaeImageProcessor,
+    // resample="lanczos" default) - plain Nearest (sd_image_to_tensor's
+    // otherwise-default) was never caught by the aa_test fixtures (fixture
+    // ref.png is already 512x512, so this resize was always a no-op there)
+    // and measured ~19% rel L2 divergence on the VAE latent for a real,
+    // non-square reference image (task 11 parity bisection).
     sd::Tensor<float> ref_full = sd_image_to_tensor(sd_img_gen_params->ref_images[0], -1, -1, true);
-    sd::Tensor<float> ref_vae  = sd_image_to_tensor(sd_img_gen_params->ref_images[0], W, H, true);
+    sd::Tensor<float> ref_vae  = sd_image_to_tensor(sd_img_gen_params->ref_images[0], W, H, true,
+                                                    sd::ops::InterpolateMode::Lanczos, /*resize_antialias=*/true);
     if (ref_full.empty() || ref_vae.empty()) {
         LOG_ERROR("failed to convert the reference image");
         return false;
@@ -6182,6 +6262,18 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
     if (pose_feature.empty()) {
         LOG_ERROR("pose guider forward failed");
         return false;
+    }
+    if (const char* step_dir = getenv("SDCPP_AA_DEBUG_STEP_LATENTS")) {
+        // Debug-only: dump the real multi-frame pose-guider output (never
+        // exercised by the aa_test fixtures, which broadcast a single pose
+        // image to all frames rather than feeding F distinct real poses) for
+        // a targeted divergence check against the same forward computed on
+        // the Python side from the identical pose PNGs.
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/pose_feature.npy", step_dir);
+        aa_save_debug_npy(path, pose_feature, lw, lh, 320, F);
+        snprintf(path, sizeof(path), "%s/ref_latent.npy", step_dir);
+        aa_save_debug_npy(path, ref_latent, lw, lh, 4, 1);
     }
 
     // --- 4. ReferenceNet forward once at t=0, CFG-doubled inputs (both ref
@@ -6358,7 +6450,23 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
             stats(x, "x", i, t);
             stats(v_pred, "v", i, t);
         }
+        if (const char* step_dir = getenv("SDCPP_AA_DEBUG_STEP_LATENTS")) {
+            // Debug-only: dump the CFG'd v-pred (model output, pre-update)
+            // and the post-DDIM-step latents for every denoising step, for
+            // step-by-step trajectory comparison against a matching Python
+            // dump (see tools/aa/e2e_compare.py --dump-steps). File naming
+            // matches ref_generate.py's stepNN_{noise_pred,latents}.npy
+            // convention.
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/step%02d_vpred.npy", step_dir, i);
+            aa_save_debug_npy(path, v_pred, lw, lh, 4, F);
+        }
         x                        = animate_anyone_scheduler::ddim_v_pred_step(x, v_pred, alpha_prod_t, alpha_prev);
+        if (const char* step_dir = getenv("SDCPP_AA_DEBUG_STEP_LATENTS")) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/step%02d_latents.npy", step_dir, i);
+            aa_save_debug_npy(path, x, lw, lh, 4, F);
+        }
 
         int64_t now = ggml_time_ms();
         pretty_progress(i + 1, steps, (now - last_step_ms) / 1000.f);

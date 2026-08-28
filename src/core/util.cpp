@@ -695,7 +695,9 @@ sd_image_t tensor_to_sd_image(const sd::Tensor<float>& tensor, int frame_index) 
 sd::Tensor<float> sd_image_to_tensor(sd_image_t image,
                                      int target_width,
                                      int target_height,
-                                     bool scale) {
+                                     bool scale,
+                                     sd::ops::InterpolateMode resize_mode,
+                                     bool resize_antialias) {
     sd::Tensor<float> tensor = sd::zeros<float>({static_cast<int64_t>(image.width),
                                                  static_cast<int64_t>(image.height),
                                                  static_cast<int64_t>(image.channel),
@@ -713,7 +715,10 @@ sd::Tensor<float> sd_image_to_tensor(sd_image_t image,
                                       {target_width,
                                        target_height,
                                        tensor.shape()[2],
-                                       tensor.shape()[3]});
+                                       tensor.shape()[3]},
+                                      resize_mode,
+                                      /*align_corners=*/false,
+                                      resize_antialias);
     }
     return tensor;
 }

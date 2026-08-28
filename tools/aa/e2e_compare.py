@@ -132,6 +132,29 @@ def run_python_reference(args, out_dir: Path) -> dict:
 
     pipe.prepare_latents = capturing_prepare_latents
 
+    # Optional: dump the per-step trajectory (the CFG'd v-pred model output
+    # fed into scheduler.step, and the resulting prev_sample latents) for
+    # step-by-step divergence analysis against the C++ side's
+    # SDCPP_AA_DEBUG_STEP_LATENTS dump. File naming matches
+    # ref_generate.py's stepNN_{noise_pred,latents}.npy convention and the
+    # C++ writer's stepNN_{vpred,latents}.npy.
+    step_dir = None
+    if args.dump_steps:
+        step_dir = out_dir / "python_steps"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        step_counter = {"i": 0}
+        orig_scheduler_step = pipe.scheduler.step
+
+        def capturing_scheduler_step(model_output, timestep, sample, *a, **kw):
+            i = step_counter["i"]
+            np.save(step_dir / f"step{i:02d}_vpred.npy", model_output.detach().cpu().numpy().astype(np.float32))
+            result = orig_scheduler_step(model_output, timestep, sample, *a, **kw)
+            np.save(step_dir / f"step{i:02d}_latents.npy", result.prev_sample.detach().cpu().numpy().astype(np.float32))
+            step_counter["i"] += 1
+            return result
+
+        pipe.scheduler.step = capturing_scheduler_step
+
     ref_image = Image.open(args.ref_image).convert("RGB")
     pose_files = sorted(Path(args.pose_dir).glob("*.png"))[: args.frames]
     if len(pose_files) < args.frames:
@@ -143,7 +166,7 @@ def run_python_reference(args, out_dir: Path) -> dict:
     print(f"[python] running pipeline: frames={args.frames} steps={args.steps} "
           f"cfg={args.cfg} size={args.width}x{args.height} seed={args.seed}")
     t0 = time.time()
-    result = pipe(
+    videos = pipe(
         ref_image,
         pose_images,
         width=args.width,
@@ -158,7 +181,7 @@ def run_python_reference(args, out_dir: Path) -> dict:
 
     frames_dir = out_dir / "python_frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
-    arr = result[0].cpu().numpy() if hasattr(result, "cpu") else result[0]  # (3, F, H, W)
+    arr = videos[0].cpu().numpy() if hasattr(videos, "cpu") else videos[0]  # (3, F, H, W)
     for f in range(args.frames):
         frame = (arr[:, f].transpose(1, 2, 0) * 255.0).round().clip(0, 255).astype(np.uint8)
         Image.fromarray(frame).save(frames_dir / f"frame_{f:02d}.png")
@@ -168,15 +191,18 @@ def run_python_reference(args, out_dir: Path) -> dict:
     print(f"[python] saved {args.frames} frames to {frames_dir}, init latent to {init_latent_path} "
           f"(shape {captured['init_latent'].shape})")
 
-    return {
+    result = {
         "wall_time_s": elapsed,
         "frames_dir": str(frames_dir),
         "init_latent_path": str(init_latent_path),
         "init_latent_shape": list(captured["init_latent"].shape),
     }
+    if step_dir is not None:
+        result["step_dir"] = str(step_dir)
+    return result
 
 
-def run_cpp(args, out_dir: Path, init_latent_path: Path) -> dict:
+def run_cpp(args, out_dir: Path, init_latent_path: Path, step_dir: Path = None) -> dict:
     if not SD_CLI.exists():
         raise SystemExit(f"C++ CLI not found at {SD_CLI}; build it first (ninja sd-cli)")
 
@@ -205,10 +231,15 @@ def run_cpp(args, out_dir: Path, init_latent_path: Path) -> dict:
     ]
     env = dict(os.environ)
     env["SDCPP_AA_DEBUG_INIT_LATENT"] = str(init_latent_path)
+    if step_dir is not None:
+        step_dir.mkdir(parents=True, exist_ok=True)
+        env["SDCPP_AA_DEBUG_STEP_LATENTS"] = str(step_dir)
 
     print("[cpp] command:")
     print("  " + " ".join(cmd))
     print(f"[cpp] SDCPP_AA_DEBUG_INIT_LATENT={init_latent_path}")
+    if step_dir is not None:
+        print(f"[cpp] SDCPP_AA_DEBUG_STEP_LATENTS={step_dir}")
 
     t0 = time.time()
     log_path = out_dir / "cpp_run.log"
@@ -219,12 +250,58 @@ def run_cpp(args, out_dir: Path, init_latent_path: Path) -> dict:
     if proc.returncode != 0:
         raise SystemExit(f"C++ CLI run failed (exit {proc.returncode}); see {log_path}")
 
-    return {
+    result = {
         "wall_time_s": elapsed,
         "frames_dir": str(cpp_frames_dir),
         "command": cmd,
         "log_path": str(log_path),
     }
+    if step_dir is not None:
+        result["step_dir"] = str(step_dir)
+    return result
+
+
+def compute_step_divergence(args, python_step_dir: Path, cpp_step_dir: Path) -> dict:
+    """Rel-L2 divergence per denoising step, for both the CFG'd v-pred model
+    output (pre-scheduler-step) and the resulting latents (post-step). Also
+    reports the step-0 vpred divergence separately since that isolates
+    per-step INPUT-assembly bugs from accumulation: with the injected
+    identical initial latent, step 0's v-pred is a function of ONLY the
+    (supposedly identical) t=999 inputs - banks, pose feature, clip embeds,
+    latent - so a large step-0 vpred delta means the divergence is already
+    present before any DDIM accumulation happens."""
+
+    def rel_l2(a, b):
+        a = a.astype(np.float64).ravel()
+        b = b.astype(np.float64).ravel()
+        denom = np.linalg.norm(a)
+        if denom == 0:
+            denom = 1.0
+        return float(np.linalg.norm(a - b) / denom)
+
+    rows = []
+    for i in range(args.steps):
+        py_vpred_p = python_step_dir / f"step{i:02d}_vpred.npy"
+        cp_vpred_p = cpp_step_dir / f"step{i:02d}_vpred.npy"
+        py_lat_p = python_step_dir / f"step{i:02d}_latents.npy"
+        cp_lat_p = cpp_step_dir / f"step{i:02d}_latents.npy"
+        if not (py_vpred_p.exists() and cp_vpred_p.exists() and py_lat_p.exists() and cp_lat_p.exists()):
+            print(f"[step-divergence] missing dump(s) for step {i}, stopping at {i} steps")
+            break
+        py_vpred = np.load(py_vpred_p)
+        cp_vpred = np.load(cp_vpred_p)
+        py_lat = np.load(py_lat_p)
+        cp_lat = np.load(cp_lat_p)
+        row = {
+            "step": i,
+            "vpred_rel_l2": rel_l2(py_vpred, cp_vpred),
+            "latents_rel_l2": rel_l2(py_lat, cp_lat),
+        }
+        rows.append(row)
+        print(f"[step-divergence] step {i}: vpred rel L2 {row['vpred_rel_l2']:.6e}, "
+              f"latents rel L2 {row['latents_rel_l2']:.6e}")
+
+    return {"rows": rows}
 
 
 def compute_ssim(args, python_frames_dir: Path, cpp_frames_dir: Path, out_dir: Path) -> dict:
@@ -271,6 +348,9 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--skip-python", action="store_true", help="reuse existing python_frames/init_latent.npy")
     ap.add_argument("--skip-cpp", action="store_true", help="reuse existing cpp_frames/")
+    ap.add_argument("--dump-steps", action="store_true",
+                     help="dump per-step v-pred + latents on both sides and report per-step rel L2 "
+                          "divergence (discriminates chaotic-amplification vs a systematic orchestration delta)")
     args = ap.parse_args()
 
     out_dir = args.out_dir
@@ -297,17 +377,26 @@ def main():
         python_frames_dir = Path(py_result["frames_dir"])
         init_latent_path = Path(py_result["init_latent_path"])
 
+    cpp_step_dir = out_dir / "cpp_steps" if args.dump_steps else None
     if args.skip_cpp:
         cpp_frames_dir = out_dir / "cpp_frames"
         report["cpp"] = {"skipped": True, "frames_dir": str(cpp_frames_dir)}
     else:
-        cpp_result = run_cpp(args, out_dir, init_latent_path)
+        cpp_result = run_cpp(args, out_dir, init_latent_path, step_dir=cpp_step_dir)
         report["cpp"] = cpp_result
         cpp_frames_dir = Path(cpp_result["frames_dir"])
 
     ssim_result = compute_ssim(args, python_frames_dir, cpp_frames_dir, out_dir)
     report["ssim"] = ssim_result
     report["pass"] = ssim_result["mean_ssim"] >= 0.85
+
+    if args.dump_steps:
+        python_step_dir = out_dir / "python_steps"
+        if not python_step_dir.exists() or (cpp_step_dir is None or not cpp_step_dir.exists()):
+            print(f"[step-divergence] skipped: missing python_steps ({python_step_dir.exists()}) "
+                  f"or cpp_steps ({cpp_step_dir is not None and cpp_step_dir.exists()})")
+        else:
+            report["step_divergence"] = compute_step_divergence(args, python_step_dir, cpp_step_dir)
 
     json_path = out_dir / "report.json"
     with open(json_path, "w") as f:
@@ -324,6 +413,11 @@ def main():
         for i, s in enumerate(ssim_result["per_frame_ssim"]):
             f.write(f"| {i} | {s:.4f} |\n")
         f.write(f"\nWorst frame: {ssim_result['worst_frame']} (ssim {ssim_result['worst_ssim']:.4f})\n")
+        if "step_divergence" in report:
+            f.write("\n## Per-step rel L2 divergence (v-pred, latents)\n\n")
+            f.write("| step | vpred rel L2 | latents rel L2 |\n|---|---|---|\n")
+            for row in report["step_divergence"]["rows"]:
+                f.write(f"| {row['step']} | {row['vpred_rel_l2']:.4e} | {row['latents_rel_l2']:.4e} |\n")
 
     print(f"\nWrote {json_path} and {md_path}")
     print(f"RESULT: mean SSIM = {ssim_result['mean_ssim']:.4f} "

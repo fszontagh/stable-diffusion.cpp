@@ -153,7 +153,8 @@ image, seed, and steps, and scores per-frame SSIM:
 
 ```sh
 /data/sdcpp-pixel-refs/venv/bin/python tools/aa/e2e_compare.py \
-  --frames 6 --steps 10 --seed 42 --cfg 3.5 --width 512 --height 512
+  --frames 6 --steps 10 --seed 42 --cfg 3.5 --width 512 --height 512 \
+  --dump-steps
 ```
 
 It (1) runs `Pose2VideoPipeline` (v2 config, motion modules on) on the
@@ -163,6 +164,10 @@ PyTorch side and captures the exact initial latent `prepare_latents()` drew
 that `.npy` so both sides denoise from the identical initial noise instead of
 relying on two unrelated RNGs to agree; (3) scores per-frame SSIM
 (`skimage.metrics.structural_similarity`) between the two frame sets.
+`--dump-steps` additionally saves the per-step CFG'd v-pred model output and
+post-DDIM-step latents on both sides (`SDCPP_AA_DEBUG_STEP_LATENTS` on the
+C++ side) and reports their per-step rel L2 divergence - the tool used below
+to tell a systematic bug apart from ordinary sampling-trajectory drift.
 
 **Why not the full 8-frame/25-step clip on CPU.** The reference venv is
 CPU-only (no CUDA torch installed) and PyTorch's 3D UNet is slow there: a
@@ -186,68 +191,105 @@ sides); the PyTorch run took ~29 min on CPU, the C++ run ~2 min on GPU
 
 | frame | SSIM |
 |---|---|
-| 0 | 0.7100 |
-| 1 | 0.7239 |
-| 2 | 0.7346 |
-| 3 | 0.7330 |
-| 4 | 0.7294 |
-| 5 | 0.7319 |
-| **mean** | **0.7271** |
+| 0 | 0.9762 |
+| 1 | 0.9754 |
+| 2 | 0.9805 |
+| 3 | 0.9796 |
+| 4 | 0.9787 |
+| 5 | 0.9792 |
+| **mean** | **0.9783** |
 
-**This is below the 0.85 acceptance bar.** Per the task plan ("if below:
-investigate per-module first, then orchestration deltas - do not tune the
-threshold"), the investigation before reporting this:
+**PASS (bar >= 0.85).** The first measurement came in at mean SSIM 0.7271 -
+below the bar. Per the task plan ("if below: investigate per-module first,
+then orchestration deltas - do not tune the threshold"), that number was
+investigated rather than accepted or the bar adjusted, and the investigation
+found and fixed a real bug; the number above is the post-fix, re-measured
+result. The trail:
 
 1. All `aa_test` fixture modes (`version`, `pose-guider`, `clip-embeds`,
    `scheduler`, `context-schedule`, `ref-bank`, `unet-step-f1`,
-   `unet-step-f8`) pass against the rebuilt binary, at their existing
-   tolerances (rel L2 <= 1e-3 per module/step).
+   `unet-step-f8`) passed against the rebuilt binary, at their existing
+   tolerances (rel L2 <= 1e-3 per module/step) - the bug was not in any
+   fixture-covered path.
 2. The Task 10 sliding-window scheduler produces the *identical* single
    window `[0,1,2,3,4,5]` as the reference's `context.py uniform()` for
    `num_frames=6 <= context_frames=24` (both take the same early-return
-   branch) - window scheduling is not a factor at this frame count.
+   branch) - window scheduling was not a factor at this frame count.
 3. **Precision bisection**: re-ran the C++ side forced to `--backend cpu
-   --type f32` (no `--diffusion-fa`, no f16) - i.e. maximum precision,
-   matching the PyTorch reference's own CPU/fp32 execution. Mean SSIM:
-   **0.7233** - statistically the same as the GPU f16 + flash-attention run
-   (0.7271). This rules out flash-attention precision and f16 quantization
-   as the primary cause; the gap exists even at matched full-precision CPU
-   execution on both sides.
-4. Visual inspection (frame 0, the worst frame): both outputs render the
-   same character (Ultraman-like suit, red/white/silver color-blocking) in
-   the same pose against the same sparkly-bead backdrop, with the same
-   overall composition. They differ in the fine-grained placement/density of
-   the background bead highlights and in a mild global color/brightness
-   shift (channel means differ by ~5-8/255) - a texture-and-tone difference,
-   not a structural/content one.
+   --type f32` (no `--diffusion-fa`, no f16). Mean SSIM: 0.7233 -
+   statistically the same as the GPU f16 + flash-attention run (0.7271),
+   ruling out flash-attention precision and f16 quantization as the cause.
+4. **Per-step divergence curve** (`--dump-steps`): rel L2 between the two
+   sides' CFG'd v-pred model output at **step 0** - before any DDIM
+   accumulation, with the injected identical initial latent - was **15%**,
+   dozens of times larger than any fixture's module-level tolerance. Per the
+   controller's decision rule, a large divergence already at step 0 means
+   the bug is in per-step *input assembly*, not sampling-trajectory
+   accumulation - chaotic amplification cannot explain a divergence that is
+   already huge before any accumulation has happened.
+5. **Bisecting the inputs**: with the identical injected latent, banks,
+   pose feature, and clip embeds are the only remaining step-0 inputs.
+   Dumped each independently (pose-guider output, VAE reference latent) from
+   both sides on the *real* e2e images (not the aa_test fixtures) and
+   compared directly:
+   - pose-guider output (6 real, distinct pose frames - never exercised by
+     the aa_test fixture, which broadcasts one pose image to every frame):
+     rel L2 1.4e-3/frame, uniform across all 6 frames - in line with the
+     fixture's own tolerance. Not the bug.
+   - VAE reference latent: rel L2 **19%** (11-30% per channel) - the smoking
+     gun.
+6. **Root cause**: `sd_image_to_tensor()`'s resize (used for the VAE
+   reference-latent path, and for pose-frame loading) defaults to
+   `InterpolateMode::Nearest` (literal nearest-neighbor), while Moore's
+   `VaeImageProcessor` (both the ref-image and pose-frame preprocessors) use
+   `resample="lanczos"`. This was invisible to every existing fixture
+   because the fixtures' `ref.png`/`pose.png` are already exactly
+   512x512 - `sd::ops::interpolate()` short-circuits to a verbatim copy when
+   input and output shapes already match (`if (input.shape() ==
+   output_shape) return input;`), so the resize path was never actually
+   exercised by any prior test. This task's real reference image
+   (`anyone-2.png`, 576x768) is the first input in this port's history to
+   force a genuine resize on this path.
+7. **Fix**: `sd_image_to_tensor()` gained optional `resize_mode` /
+   `resize_antialias` parameters (default unchanged - `Nearest`, no
+   antialias - so every other caller across the codebase is untouched); the
+   two AnimateAnyone call sites (`aa_load_image_tensor` for pose frames,
+   and the ref-image VAE resize in `generate_animate_anyone()`) now pass
+   `Lanczos` + antialias, matching Moore's resampler family. `src/core/util.h`,
+   `src/core/util.cpp`, `src/stable-diffusion.cpp`.
+8. **Effect of the fix**: VAE ref-latent rel L2 dropped 19% -> 3.7%; step-0
+   v-pred rel L2 dropped 15% -> 1.4%; mean SSIM went 0.7271 -> **0.9783**.
 
-**Conclusion**: this looks like legitimate sampling-trajectory sensitivity
-- the reference's own scheduler/precision caveats (task 8's ~1.6e-2 rel L2
-for flash attention, plus ordinary f32 accumulation-order differences
-between two independent UNet implementations) compounding across a 10-step
-CFG'd DDIM loop, not an orchestration bug: module fixtures are exact, window
-scheduling is exact, and the precision bisection shows the gap is
-backend-independent. SSIM is also a strict metric for exactly this kind of
-"same content, different fine texture" delta - the images read as the same
-generation to a human at a glance. The measured number is reported honestly
-here rather than adjusting the bar; a full 8-frame/25-step run (GPU-side
-already fast; PyTorch-side would need a CUDA-enabled reference venv or a
-much longer CPU budget) is the natural next step to see whether more steps
-narrow or widen the gap.
+**Residual divergence, post-fix**: the per-step rel L2 curve is now smooth
+and monotonically growing with no jumps - v-pred: 1.4e-2, 3.8e-2, 5.6e-2,
+6.4e-2, 8.8e-2, 9.5e-2, 10.6e-2, 10.6e-2, 10.4e-2, 11.9e-2 (steps 0-9);
+latents: 1.3e-3, 3.3e-3, 7.2e-3, 12.6e-3, 22.3e-3, 33.0e-3, 46.3e-3, 59.4e-3,
+70.7e-3, 84.2e-3. This is the textbook signature of ordinary DDIM
+sampling-trajectory sensitivity (small per-module deltas - the port's own
+~3.7% residual resize-algorithm mismatch, `InterpolateMode::Lanczos` is not
+literally Pillow-bit-exact the way the dedicated CLIP-preprocessing path is
+- compounding smoothly across a CFG'd loop), not a further systematic bug,
+and is consistent with the task brief's own framing that bit-parity is not
+the bar.
 
-Reproduce: `tools/aa/e2e_compare.py --skip-python` re-scores existing
-`python_frames/` against a freshly re-run C++ side; drop `--skip-python` to
-redo the full comparison from scratch. Frames, the injected initial latent,
-and the JSON/markdown report are saved under
-`/data/sdcpp-pixel-refs/outputs/task11/`.
+Reproduce: `tools/aa/e2e_compare.py --skip-python --dump-steps` re-scores
+existing `python_frames/`/`python_steps/` against a freshly re-run C++ side;
+drop `--skip-python` to redo the full comparison from scratch. Frames, the
+injected initial latent, per-step dumps, and the JSON/markdown report are
+saved under `/data/sdcpp-pixel-refs/outputs/task11/`.
 
 ## Known limitations
 
-- End-to-end parity: the measured mean SSIM against the PyTorch reference on
-  a reduced 6-frame/10-step clip is 0.727 (see above), below the 0.85
-  informal bar; per-module fixtures and window scheduling are exact, and the
-  gap persists at matched full CPU/fp32 precision on both sides, pointing to
-  ordinary DDIM sampling-trajectory sensitivity rather than a bug.
+- End-to-end parity: mean SSIM against the PyTorch reference on a reduced
+  6-frame/10-step clip is 0.978 (see above), passing the 0.85 bar. A
+  step-by-step divergence bisection along the way found and fixed a real
+  bug - `sd_image_to_tensor()`'s image resize defaulted to nearest-neighbor
+  where the reference uses Lanczos, invisible to every fixture because the
+  fixture images are already exactly target-sized (a no-op resize) - now
+  fixed for the two AnimateAnyone resize call sites (pose frames, VAE
+  reference latent). The small residual divergence left after the fix shows
+  a smooth, jump-free per-step growth curve consistent with ordinary DDIM
+  sampling-trajectory sensitivity, not a further orchestration bug.
 - Flash attention (required for F > 1 on 12 GB cards) costs measurable
   precision in the bank-doubled attention (task 8 measured ~1.6e-2 rel L2 on
   the step fixture vs ~3e-4 on CPU). End-to-end quality is still good; exact
