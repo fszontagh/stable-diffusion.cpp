@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <set>
+#include <sstream>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -5768,6 +5770,9 @@ static constexpr int AA_MAX_TOTAL_FRAMES                = 128;
 static constexpr int AA_CONTEXT_FRAMES  = 24;
 static constexpr int AA_CONTEXT_STRIDE  = 1;
 static constexpr int AA_CONTEXT_OVERLAP = 4;
+static_assert(AA_CONTEXT_FRAMES <= AA_MOTION_MODULE_MAX_WINDOW_FRAMES,
+              "the context window handed to the motion module per sliding-window step must not "
+              "exceed the motion module's compiled positional-encoding ceiling");
 
 // Lexicographically sorted list of regular files in `dir` (the documented
 // --pose-dir convention: frames stored as images named in character order).
@@ -5897,6 +5902,136 @@ static sd::Tensor<float> aa_load_image_tensor(const std::string& path, int targe
     sd::Tensor<float> tensor = sd_image_to_tensor(image, target_w, target_h, scale);
     free(pixels);
     return tensor;
+}
+
+// Loads SDCPP_AA_DEBUG_INIT_LATENT into `x` (shape [W,H,4,F], W fastest).
+// Accepts two on-disk layouts, both produced by tools/aa/ref_generate.py and
+// friends:
+//   - a .npy file (numpy save format: "\x93NUMPY" magic + a little dict
+//     header + raw fp32 payload), C-contiguous, shape (1,4,F,H,W) or
+//     (4,F,H,W) - numpy's fastest-varying axis is W (rightmost), matching
+//     this port's W-fastest convention only on the W/H pair; numpy's axis
+//     order after H is (F, C) while `x`'s is (C, F), so for F>1 the payload
+//     must be explicitly re-strided, not fread() verbatim (this is the
+//     Task 9 review's noted non-interop: the raw-fread path below silently
+//     produced a wrong tensor for any F>1 .npy dump, and .npy dumps - what
+//     ref_generate.py actually writes via np.save - were rejected outright
+//     because fread() choked on the 128-byte header).
+//   - a legacy headerless raw fp32 dump (numpy .tofile()) in the same
+//     (1,4,F,H,W)-conceptual axis order; only exact at F=1, where the (F,C)
+//     vs (C,F) ordering is moot.
+static bool aa_load_debug_init_latent(const std::string& path, sd::Tensor<float>* x, int W, int H, int F) {
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (fp == nullptr) {
+        LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: failed to open '%s'", path.c_str());
+        return false;
+    }
+    struct FileCloser {
+        FILE* fp;
+        ~FileCloser() { fclose(fp); }
+    } closer{fp};
+
+    char magic[6] = {0};
+    bool is_npy   = fread(magic, 1, 6, fp) == 6 && memcmp(magic, "\x93NUMPY", 6) == 0;
+
+    std::vector<int64_t> shape;
+    if (is_npy) {
+        unsigned char ver[2];
+        if (fread(ver, 1, 2, fp) != 2) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: truncated .npy version in '%s'", path.c_str());
+            return false;
+        }
+        uint32_t header_len = 0;
+        if (ver[0] == 1) {
+            uint16_t len16 = 0;
+            if (fread(&len16, sizeof(len16), 1, fp) != 1) {
+                LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: truncated .npy header length in '%s'", path.c_str());
+                return false;
+            }
+            header_len = len16;
+        } else {
+            if (fread(&header_len, sizeof(header_len), 1, fp) != 1) {
+                LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: truncated .npy header length in '%s'", path.c_str());
+                return false;
+            }
+        }
+        std::string header(header_len, '\0');
+        if (fread(header.data(), 1, header_len, fp) != header_len) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: truncated .npy header in '%s'", path.c_str());
+            return false;
+        }
+        if (header.find("'descr': '<f4'") == std::string::npos) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: '%s' is not a little-endian float32 .npy array",
+                       path.c_str());
+            return false;
+        }
+        if (header.find("'fortran_order': False") == std::string::npos) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: '%s' must be C-contiguous (fortran_order: False)",
+                       path.c_str());
+            return false;
+        }
+        size_t shape_start = header.find("'shape': (");
+        if (shape_start == std::string::npos) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: no 'shape' field in '%s'", path.c_str());
+            return false;
+        }
+        shape_start += strlen("'shape': (");
+        size_t shape_end = header.find(')', shape_start);
+        std::string shape_str = header.substr(shape_start, shape_end - shape_start);
+        std::stringstream ss(shape_str);
+        std::string dim_str;
+        while (std::getline(ss, dim_str, ',')) {
+            // trim whitespace
+            size_t a = dim_str.find_first_not_of(" \t");
+            size_t b = dim_str.find_last_not_of(" \t");
+            if (a == std::string::npos) continue;
+            shape.push_back(std::stoll(dim_str.substr(a, b - a + 1)));
+        }
+        // Drop a leading batch dim of 1: (1,4,F,H,W) -> (4,F,H,W).
+        if (shape.size() == 5 && shape[0] == 1) {
+            shape.erase(shape.begin());
+        }
+        if (shape.size() != 4 || shape[0] != 4 || shape[1] != F || shape[2] != H || shape[3] != W) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: '%s' shape mismatch (got rank %zu, expected (4,%d,%d,%d) "
+                       "or (1,4,%d,%d,%d))",
+                       path.c_str(), shape.size(), F, H, W, F, H, W);
+            return false;
+        }
+        // npy axis order (C,F,H,W), W fastest -> read the raw payload
+        // directly into a flat buffer, then re-stride into x's (W,H,C,F)
+        // layout element by element (small tensor; clarity over speed here).
+        std::vector<float> raw(static_cast<size_t>(4) * F * H * W);
+        if (fread(raw.data(), sizeof(float), raw.size(), fp) != raw.size()) {
+            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: truncated .npy payload in '%s'", path.c_str());
+            return false;
+        }
+        for (int c = 0; c < 4; ++c) {
+            for (int f = 0; f < F; ++f) {
+                for (int h = 0; h < H; ++h) {
+                    for (int w = 0; w < W; ++w) {
+                        size_t raw_idx = (((static_cast<size_t>(c) * F + f) * H + h) * W + w);
+                        x->index(w, h, c, f) = raw[raw_idx];
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    // Legacy headerless raw dump: only well-defined at F=1 (see comment
+    // above), where (C,F) vs (F,C) ordering doesn't matter.
+    if (F != 1) {
+        LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: '%s' has no .npy header and F=%d != 1; headerless raw dumps "
+                   "are only unambiguous at F=1 - dump a .npy instead (tools/aa/ref_generate.py np.save)",
+                   path.c_str(), F);
+        return false;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0 ||
+        fread(x->data(), sizeof(float), static_cast<size_t>(x->numel()), fp) != static_cast<size_t>(x->numel())) {
+        LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: failed to read raw dump '%s'", path.c_str());
+        return false;
+    }
+    return true;
 }
 
 // AnimateAnyone end-to-end generation (P-map section 5, pose2img/pose2vid):
@@ -6076,17 +6211,13 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
     sd::Tensor<float> x({lw, lh, 4, F});
     x = sd::Tensor<float>::randn_like(x, sd->rng);
     if (const char* init_path = getenv("SDCPP_AA_DEBUG_INIT_LATENT")) {
-        // Debug-only: load a raw fp32 dump (numpy (1,4,F,H/8,W/8).tofile) as
-        // the initial latent, for step-by-step trajectory comparison against
-        // the PyTorch reference. F=1 only (flat layouts coincide at F=1).
-        FILE* fp = fopen(init_path, "rb");
-        if (fp == nullptr || F != 1 ||
-            fread(x.data(), sizeof(float), x.numel(), fp) != (size_t)x.numel()) {
-            LOG_ERROR("SDCPP_AA_DEBUG_INIT_LATENT: failed to load '%s'", init_path);
-            if (fp) fclose(fp);
+        // Debug-only: load the initial latent dumped from the PyTorch
+        // reference (tools/aa/ref_generate.py's init_latent.npy, or a
+        // legacy headerless F=1 raw dump), for trajectory-level parity
+        // comparison. See aa_load_debug_init_latent() for the two formats.
+        if (!aa_load_debug_init_latent(init_path, &x, lw, lh, F)) {
             return false;
         }
-        fclose(fp);
         LOG_INFO("SDCPP_AA_DEBUG_INIT_LATENT: initial latent loaded from '%s'", init_path);
     }
 
