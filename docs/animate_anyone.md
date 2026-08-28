@@ -78,18 +78,23 @@ and the `--ref-pose` CLI requirement) but does not run it through any
 weights, since doing so is provably inert to the returned features. See
 `src/model/adapter/pose_guider_ssd.hpp` for the exact evidence trail.
 
-Weights: no stable HTTP mirror is known; the only source found is a Google
-Drive share (`tools/aa/download_weights.sh` attempts it with `gdown`, best
-effort). As of this port those individual file downloads were **blocked**
-(quota/permission errors), and the shared folder itself was confirmed to
-contain only `denoising_unet-30000.pth`/`reference_unet-30000.pth`/
-`motion_module.pth` - no `pose_guider.pth`. `tools/aa/dump_fixtures.py
---variant b` falls back to a fixed-seed **random-init** `PoseGuiderB`
-checkpoint in that case (still a valid numerical fixture for the module
-port - it exercises the exact same wiring/shapes, just not trained weights).
-If you obtain a real checkpoint, identify it by tensor inspection (a
-`conv_layers.0.weight` key of shape `(3,3,3,3)`), not by filename, and place
-it at `--pose-guider <path>`.
+Weights (status 2026-08-28): the paper's Google Drive folder
+(`1VxbOv5PE441NsNStQlmqbIw0iyY9Mn9L`) is still publicly browsable; only the
+file ids hardcoded in the upstream readme are stale (scrape the current ids
+from the folder DOM). It contains exactly three files:
+`denoising_unet-30000.pth` and `reference_unet-30000.pth` (genuine sprite
+finetunes - same key set and shapes as the Moore baseline, weights differ),
+and `motion_module.pth` (byte-identical to the Moore baseline). A trained
+**variant B pose guider was never released** (confirmed by the upstream
+repo's open, unanswered issue #3), and no mirror exists. The runnable
+Sprite-Sheet-Diffusion configuration is therefore: SSD's two finetuned UNets
+paired with Moore's variant A `pose_guider.pth` and the baseline
+`motion_module.pth`. `tools/aa/dump_fixtures.py --variant b` uses a
+fixed-seed **random-init** `PoseGuiderB` checkpoint (still a valid numerical
+fixture for the module port - it exercises the exact same wiring/shapes,
+just not trained weights). If a real checkpoint ever surfaces, identify it
+by tensor inspection (a `conv_layers.0.weight` key of shape `(3,3,3,3)`),
+not by filename, and place it at `--pose-guider <path>`.
 
 Test: `sd-aa-test pose-guider-b` compares all 5 pyramid features against
 `tools/aa/dump_fixtures.py --variant b`'s `pose_guider_b_out_{0..4}.npy` at
@@ -190,6 +195,36 @@ includes reading the torch zip checkpoints):
 |---|---|---|
 | img_gen 1 frame | ~94 s | ~5.2 GB |
 | vid_gen 8 frames | ~251 s | ~7.4 GB |
+
+## Identity preservation for stylized characters
+
+Findings from a pixel-art knight smoke run (RTX 3060, Moore baseline
+weights). AnimateAnyone repaints the reference character onto the driving
+skeleton, so identity survives only when the pose geometry agrees with the
+reference. Three rules, each independently verified by an ablation:
+
+1. **Match skeleton proportions to the character.** Driving a chibi
+   character (head about 1/3 of body height) with a stock human skeleton
+   re-proportions the character and washes out its identifying details.
+   Retarget at the keypoint level (scale bone lengths, then re-render with
+   the DWpose drawing code the pose guider was trained on). Warping the
+   rendered pose image instead corrupts the skeleton and the pose guider
+   misreads it.
+2. **Match aspect ratio.** Generate at the reference image's aspect. A
+   square reference fed into a 2:3 generation is vertically stretched
+   before the ReferenceNet ever sees it.
+3. **Match framing.** The skeleton should fill the frame the way the
+   character fills the reference. Large empty canvas areas get filled with
+   hallucinations (phantom second characters, floating props).
+
+Also: run vid_gen at the motion module's native 24 frame window. F=8 is
+off-distribution for mm_sd_v15_v2 and shows progressive late-window drift
+(scribble artifacts from about frame 7); at F=24 (e.g. a periodic 8 frame
+walk cycle repeated 3x) the whole window stays clean. Omit face and hand
+landmarks when the head is stylized - an oversized face circle gets
+hallucinated as facial armor. At 512x768 and above, `--vae-tiling` is
+required on 12 GB (the full-frame VAE decode graph wants a ~2.5 GB compute
+buffer on top of resident weights).
 
 ## Extracting pose frames from the Moore demo assets
 
