@@ -83,7 +83,7 @@ static void print_usage() {
             "      <fixtures>/pose.png + <fixtures>/ref_pose.png (both rescaled to [-1,1] -\n"
             "      variant B normalization, unlike variant A's [0,1]), and compares all 5\n"
             "      pyramid features against <fixtures>/pose_guider_b_out_{0..4}.npy. Exits 0\n"
-            "      only if every feature passes (rel L2 <= 1e-3), 1 otherwise.\n"
+            "      only if every feature passes (rel L2 <= 2e-3), 1 otherwise.\n"
             "  clip-embeds [--clip-vision <path>] [--fixtures <dir>]\n"
             "      Loads the sd-image-variations CLIPVisionModelWithProjection encoder\n"
             "      (default: $SDCPP_AA_WEIGHTS or /data/sdcpp-pixel-refs/weights, plus\n"
@@ -93,9 +93,9 @@ static void print_usage() {
             "        STRICT (the pass/fail gate on model correctness): forwards\n"
             "        <fixtures>/pixel_values.npy, the reference pipeline's own exact\n"
             "        preprocessed input, and requires rel L2 <= 1e-3.\n"
-            "        preprocessing tolerance (informational, resampler not Pillow-bit-exact):\n"
-            "        CLIP-preprocesses <fixtures>/ref.png through this test's own\n"
-            "        image->resize->normalize chain and requires rel L2 <= 2e-3.\n"
+            "        preprocessing-chain check, exit-code enforced at <= 2e-3 (resampler not\n"
+            "        Pillow-bit-exact): CLIP-preprocesses <fixtures>/ref.png through this\n"
+            "        test's own image->resize->normalize chain and requires rel L2 <= 2e-3.\n"
             "      Prints both relative L2 errors. Exits 0 only if both pass, 1 otherwise.\n"
             "  scheduler [--fixtures <dir>]\n"
             "      Verifies the AnimateAnyone v2 scheduler math (zero-SNR rescaled\n"
@@ -399,7 +399,14 @@ static int run_pose_guider_mode(int argc, char** argv) {
 // differs from variant A's [0,1] above), and compares all 5 pyramid
 // features against <fixtures>/pose_guider_b_out_{0..4}.npy.
 static int run_pose_guider_b_mode(int argc, char** argv) {
-    std::string weights_path = aa_weights_root() + "/SSD/pose_guider.pth";
+    // Default weight path mirrors the dumper's fallback (tools/aa/dump_fixtures.py):
+    // the released pose_guider.pth is blocked (Google Drive quota/permission errors),
+    // so when it isn't present on disk, fall back to the fixed-seed random-init
+    // checkpoint the dumper generates alongside it.
+    bool weights_path_explicit = false;
+    std::string released_weights_path    = aa_weights_root() + "/SSD/pose_guider.pth";
+    std::string random_init_weights_path = aa_weights_root() + "/SSD/pose_guider_random_init.pth";
+    std::string weights_path             = released_weights_path;
     std::string fixtures_dir;
     if (const char* env = std::getenv("SDCPP_AA_FIXTURES")) {
         fixtures_dir = env;
@@ -415,6 +422,7 @@ static int run_pose_guider_b_mode(int argc, char** argv) {
                 return 1;
             }
             weights_path = argv[++i];
+            weights_path_explicit = true;
         } else if (arg == "--fixtures") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "error: --fixtures requires a value\n");
@@ -426,6 +434,18 @@ static int run_pose_guider_b_mode(int argc, char** argv) {
             return 1;
         }
     }
+
+    if (!weights_path_explicit && weights_path == released_weights_path) {
+        std::ifstream released_probe(released_weights_path, std::ios::binary);
+        if (!released_probe.good()) {
+            weights_path = random_init_weights_path;
+            printf("NOTE: released weights not found at '%s' - falling back to "
+                   "RANDOM-INIT checkpoint '%s' (mirrors tools/aa/dump_fixtures.py's "
+                   "fallback; gdown is blocked on the released file).\n",
+                   released_weights_path.c_str(), random_init_weights_path.c_str());
+        }
+    }
+    printf("using pose guider (variant B) weights: %s\n", weights_path.c_str());
 
     std::string pose_image_path     = fixtures_dir + "/pose.png";
     std::string ref_pose_image_path = fixtures_dir + "/ref_pose.png";

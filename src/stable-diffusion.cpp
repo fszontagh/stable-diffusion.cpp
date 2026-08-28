@@ -7917,6 +7917,11 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         return generate_animatediff_video(sd_ctx, sd_vid_gen_params, frames_out, num_frames_out);
     }
 
+    if (sd_ctx->sd->version == VERSION_ANIMATE_ANYONE && !sd_ctx->sd->animatediff_loaded) {
+        LOG_ERROR("AnimateAnyone vid_gen requires --motion-module");
+        return false;
+    }
+
     sd_ctx->sd->reset_cancel_flag();
 
     const RefImageParams ref_image_params;
