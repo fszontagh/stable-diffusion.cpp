@@ -32,6 +32,78 @@ Download from HF [patrolli/AnimateAnyone](https://huggingface.co/patrolli/Animat
 The family is detected when an SD1-signature diffusion model is loaded
 together with `--reference-net`.
 
+## Pose guider variant B (Sprite-Sheet-Diffusion)
+
+Sprite-Sheet-Diffusion forks Moore-AnimateAnyone but
+replaces the pose guider with a different, sprite-finetuned module
+(`ModelTraining/models/pose_guider.py`): an 8-layer Conv+BatchNorm+ReLU stem
+into a zero-initialized 1x1 projection and a learnable scalar `scale`
+(init 2), followed by four downsampling towers each paired with a
+self-attention `Transformer2DModel` block ("cross_attn1..4" in the
+checkpoint - see the caveat below). It returns 5 pyramid features
+(320/320/640/1280/1280 channels at 1/8, 1/16, 1/32, 1/64, 1/64 resolution)
+instead of variant A's single 320-channel 1/8-resolution feature, and is
+injected ControlNet-style: `fea[0]` after `conv_in` (shared with variant A),
+`fea[1..4]` added after down_blocks 0-3 respectively.
+
+**Variant selection is automatic**, probed from the loaded `--pose-guider`
+checkpoint's own tensor names: `conv_layers.0.weight` present selects variant
+B, `blocks.0.weight` selects variant A (Moore). Variant B additionally
+requires `--ref-pose <path>` (a single reference pose image, matching
+the upstream `pose_guider(pose, ref_pose)` API); generation fails loudly if
+it's missing.
+
+**Pose normalization differs by variant**: variant A images stay in `[0,1]`
+(`do_normalize=False` in Moore's `cond_image_processor`); variant B rescales
+both the per-frame pose images AND `--ref-pose` to `[-1,1]`
+(`do_normalize=True` in the S pipelines - getting this wrong silently
+degrades output). This port applies the correct normalization automatically
+based on the probed variant; no extra flag is needed.
+
+**Wiring caveat (transcribed exactly, not "fixed"):** reading
+`ModelTraining/models/attention.py`'s `BasicTransformerBlock.__init__`, the
+local `Transformer2DModel` used by `cross_attn1..4` is instantiated with
+`cross_attention_dim=None` and `double_self_attention=False`, so that block
+never allocates `attn2`/`norm2` at all (`self.attn2 = None`), and its
+`forward()` only runs cross-attention `if self.attn2 is not None`. That means
+despite `pose_guider.py`'s `forward(x, ref_x)` computing a whole `ref_x`
+branch through the same conv towers and calling
+`cross_attn{k}(x, ref_x)`, the `encoder_hidden_states=ref_x` argument is
+**never consumed** - `cross_attn{k}` is pure self-attention on `x`. The
+reference-pose branch is dead code in the upstream implementation (almost
+certainly an authoring bug). This port transcribes the wiring exactly per
+the task brief ("the .py file is the source of truth"): `PoseGuiderB`
+accepts and validates a `ref_pose` tensor (matching the upstream signature
+and the `--ref-pose` CLI requirement) but does not run it through any
+weights, since doing so is provably inert to the returned features. See
+`src/model/adapter/pose_guider_ssd.hpp` for the exact evidence trail.
+
+Weights: no stable HTTP mirror is known; the only source found is a Google
+Drive share (`tools/aa/download_weights.sh` attempts it with `gdown`, best
+effort). As of this port those individual file downloads were **blocked**
+(quota/permission errors), and the shared folder itself was confirmed to
+contain only `denoising_unet-30000.pth`/`reference_unet-30000.pth`/
+`motion_module.pth` - no `pose_guider.pth`. `tools/aa/dump_fixtures.py
+--variant b` falls back to a fixed-seed **random-init** `PoseGuiderB`
+checkpoint in that case (still a valid numerical fixture for the module
+port - it exercises the exact same wiring/shapes, just not trained weights).
+If you obtain a real checkpoint, identify it by tensor inspection (a
+`conv_layers.0.weight` key of shape `(3,3,3,3)`), not by filename, and place
+it at `--pose-guider <path>`.
+
+Test: `sd-aa-test pose-guider-b` compares all 5 pyramid features against
+`tools/aa/dump_fixtures.py --variant b`'s `pose_guider_b_out_{0..4}.npy` at
+relative L2 <= 2e-3 per feature (variant A's `pose-guider` mode uses 1e-3;
+this one is loosened per Task 5's atol+rtol ruling, with a numeric
+justification: measured error grows near-linearly with the number of
+`cross_attn{k}` `Transformer2DModel` blocks applied so far - 0, 3.1e-4,
+7.5e-4, 9.7e-4, 1.15e-3 for fea[0..4] - tracing to the shared
+`FeedForward`/`GEGLU` block's `ggml_gelu()` tanh approximation, a
+long-standing ggml behavior that diffusers' own exact erf-based GEGLU
+doesn't use; PoseGuiderB simply chains more of these blocks (4) than
+anything else in the port checks in one fixture. See the comment at the
+tolerance constant in `examples/aa_test/main.cpp` for the full derivation).
+
 ## Inputs
 
 - `-r/--ref-image`: the character reference image (any resolution; it is
@@ -301,3 +373,10 @@ saved under `/data/sdcpp-pixel-refs/outputs/task11/`.
   terminal alpha cannot be represented in the sigma-space samplers).
 - Back-view outputs: like the reference implementation, the model sometimes
   renders the character facing away when the pose skeleton is ambiguous.
+- Pose guider variant B (Sprite-Sheet-Diffusion): the module port is verified
+  against a fixture (`sd-aa-test pose-guider-b`), but no released checkpoint
+  was obtainable (Google Drive quota/permission errors on every known
+  source - see the variant B section above), so it is fixture-verified only
+  with a random-init checkpoint. An end-to-end sprite-generation smoke test
+  and SSIM comparison against the PyTorch reference were not run for this
+  reason.

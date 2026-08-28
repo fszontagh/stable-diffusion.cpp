@@ -83,6 +83,42 @@ download "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/res
 download "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/unet/diffusion_pytorch_model.bin" \
   "$WEIGHTS_DIR/stable-diffusion-v1-5/unet/diffusion_pytorch_model.bin"
 
+# --- Sprite-Sheet-Diffusion pose guider weights (Task 12) ---
+# Best-effort only: these are Google Drive shares, not a stable HTTP mirror,
+# and are known to hit quota/permission errors ("Cannot retrieve the public
+# link of the file") independent of anything this script does. If gdown
+# fails here, tools/aa/dump_fixtures.py --variant b falls back to a
+# fixed-seed RANDOM-INIT PoseGuiderB checkpoint (a valid numerical fixture
+# for the module port, just not the trained weights) - see docs/animate_anyone.md.
+#
+# P-map section 6 / ModelTraining/pretrained_model/download_gdrive.sh lists
+# three individual file ids (almost certainly denoising_unet/reference_unet/
+# pose_guider, unconfirmed by filename - identify by tensor inspection, not
+# name) plus a shared folder id. As of this port, the folder itself was
+# confirmed to contain only denoising_unet-30000.pth, reference_unet-30000.pth
+# and motion_module.pth - no pose_guider.pth - so the three individual ids
+# below are the only known source for it.
+SSD_WEIGHTS_DIR="$WEIGHTS_DIR/SSD"
+mkdir -p "$SSD_WEIGHTS_DIR"
+if ! python3 -c "import gdown" >/dev/null 2>&1; then
+  echo "gdown not found; installing into the current Python environment ..."
+  pip install gdown -q || echo "WARNING: pip install gdown failed; skipping SSD weight download"
+fi
+if python3 -c "import gdown" >/dev/null 2>&1; then
+  for id in 1vSexqqHmqRE5lXSxS_nOpJVtHswmxqwU 1wab2SnWKznqtgEgnoICbI_iioeHHajb9 1SYJj4IJTlYqNzodA2avbleBFbviUkXR7; do
+    echo "gdown $id -> $SSD_WEIGHTS_DIR/ (best-effort; identify the result by tensor inspection, not filename)"
+    ( cd "$SSD_WEIGHTS_DIR" && python3 -m gdown "$id" ) || \
+      echo "WARNING: gdown failed for file id $id (Google Drive quota/permission error is common and NOT a bug in this script)"
+  done
+  echo "gdown --folder 1VxbOv5PE441NsNStQlmqbIw0iyY9Mn9L -> $SSD_WEIGHTS_DIR/ (best-effort)"
+  ( cd "$SSD_WEIGHTS_DIR" && python3 -m gdown --folder 1VxbOv5PE441NsNStQlmqbIw0iyY9Mn9L ) || \
+    echo "WARNING: gdown --folder failed (Google Drive quota/permission error is common and NOT a bug in this script)"
+  echo "If a downloaded file is a genuine pose_guider.pth (state_dict with a 'conv_layers.0.weight' key)," \
+       "move/rename it to $SSD_WEIGHTS_DIR/pose_guider.pth so dump_fixtures.py --variant b picks it up."
+else
+  echo "gdown unavailable; skipping SSD weight download (variant B fixtures will use the RANDOM-INIT fallback)"
+fi
+
 echo "Writing MANIFEST.txt ..."
 MANIFEST="$WEIGHTS_DIR/MANIFEST.txt"
 {

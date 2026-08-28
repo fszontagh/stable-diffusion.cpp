@@ -257,6 +257,108 @@ print(f"  wrote {FIXTURES_DIR / 'ref.png'}")
 print(f"  wrote {FIXTURES_DIR / 'pose.png'}")
 print(f"  wrote {FIXTURES_DIR / 'ref_pose.png'}")
 
+
+def dump_pose_guider_b_fixture():
+    """--variant b: dump pose_guider_b_out_{0..4}.npy using the S repo's own
+    ModelTraining/models/pose_guider.py PoseGuider (the source of truth for
+    Task 12 - see docs/superpowers/notes/animate-anyone-pytorch-map.md section
+    6). Fed pose.png + ref_pose.png (written above), BOTH rescaled to [-1,1]
+    (do_normalize=True in the S pipelines - porting note 5, differs from
+    variant A's [0,1]).
+
+    Weight source: SDCPP_AA_WEIGHTS/SSD/pose_guider.pth if present (a real
+    released checkpoint, identified by tensor inspection - not by filename -
+    were one ever obtained); otherwise a fixed-seed RANDOM-INIT PoseGuider,
+    whose state_dict is saved next to it as a valid numerical fixture for the
+    module port (Task 12 brief's documented fallback: gdown was BLOCKED on
+    Google Drive quota/permission errors for all three individual
+    pose_guider-shaped file ids, and the shared folder itself contains only
+    denoising_unet/reference_unet/motion_module - no pose_guider.pth at all)."""
+    ssd_model_training = SPRITE_REPO / "ModelTraining"
+    sys.path.insert(0, str(ssd_model_training))
+    from models.pose_guider import PoseGuider as SSDPoseGuider  # noqa: E402
+
+    model = SSDPoseGuider(noise_latent_channels=320, use_ca=True).to(DEVICE, dtype=DTYPE)
+
+    released_path = WEIGHTS_DIR / "SSD" / "pose_guider.pth"
+    weights_source = None
+    if released_path.exists():
+        state_dict = torch.load(released_path, map_location="cpu")
+        # Identify by tensor inspection (task 12 brief), not filename: a real
+        # PoseGuiderB checkpoint must contain conv_layers.0.weight with the
+        # exact (3,3,3,3) shape from the source-of-truth wiring.
+        key = "conv_layers.0.weight"
+        if key not in state_dict or tuple(state_dict[key].shape) != (3, 3, 3, 3):
+            raise RuntimeError(
+                f"{released_path} does not look like a PoseGuiderB state_dict "
+                f"(missing/mismatched '{key}')"
+            )
+        model.load_state_dict(state_dict, strict=True)
+        weights_source = f"released: {released_path}"
+        print(f"  loaded released PoseGuiderB weights from {released_path}")
+    else:
+        torch.manual_seed(SEED)
+        random_init_path = WEIGHTS_DIR / "SSD" / "pose_guider_random_init.pth"
+        random_init_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), random_init_path)
+        weights_source = f"RANDOM-INIT fallback (gdown blocked): {random_init_path}"
+        print(f"  NOTE: no released weights at {released_path} - gdown was BLOCKED "
+              "(Google Drive quota/permission errors on all three individual file "
+              "ids; the shared folder has no pose_guider.pth). Using a fixed-seed "
+              f"RANDOM-INIT PoseGuiderB instead, saved to {random_init_path}.")
+
+    model.eval()
+
+    def to_neg1_1(img):
+        arr = np.asarray(img).astype(np.float32) / 255.0  # [0,1], (H,W,3)
+        arr = arr * 2.0 - 1.0  # [-1,1] - do_normalize=True (porting note 5)
+        t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+        return t.unsqueeze(2)  # (1,3,1,H,W) - forward()'s rearrange expects b c f h w
+
+    pose_t = to_neg1_1(pose_image).to(DEVICE, dtype=DTYPE)
+    ref_pose_t = to_neg1_1(ref_pose_image).to(DEVICE, dtype=DTYPE).squeeze(2)  # (1,3,H,W) - ref_x has no frame axis
+
+    torch.manual_seed(SEED)
+    with torch.no_grad():
+        feas = model(pose_t, ref_pose_t)
+    assert len(feas) == 5, f"expected 5 pyramid features, got {len(feas)}"
+    expected_shapes = [
+        (1, 320, 1, 64, 64),
+        (1, 320, 1, 32, 32),
+        (1, 640, 1, 16, 16),
+        (1, 1280, 1, 8, 8),
+        (1, 1280, 1, 8, 8),
+    ]
+    for i, (fea, expected_shape) in enumerate(zip(feas, expected_shapes)):
+        assert tuple(fea.shape) == expected_shape, (i, fea.shape, expected_shape)
+        save_npy(f"pose_guider_b_out_{i}", fea)
+
+    manifest_path = FIXTURES_DIR / "manifest.json"
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            full_manifest = json.load(f)
+    else:
+        full_manifest = {"npy_files": {}, "other_files": {}}
+    full_manifest.setdefault("npy_files", {}).update(manifest)
+    full_manifest.setdefault("notes", {})["pose_guider_b_weights"] = weights_source
+    with open(manifest_path, "w") as f:
+        json.dump(full_manifest, f, indent=2)
+    print(f"  updated {manifest_path} (pose_guider_b_out_{{0..4}}.npy entries)")
+    print(f"  weights source: {weights_source}")
+
+
+if "--variant" in sys.argv:
+    idx = sys.argv.index("--variant")
+    variant = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+    if variant == "b":
+        print("=== variant b: PoseGuiderB (Sprite-Sheet-Diffusion) ===")
+        dump_pose_guider_b_fixture()
+        print("\nDone (variant b).")
+        sys.exit(0)
+    else:
+        print(f"error: unknown --variant '{variant}' (expected 'b')", file=sys.stderr)
+        sys.exit(1)
+
 # ---------------------------------------------------------------------------
 # 1. Load models exactly like scripts/pose2vid.py (P-map section 5)
 # ---------------------------------------------------------------------------

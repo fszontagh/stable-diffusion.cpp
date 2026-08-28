@@ -28,6 +28,7 @@
 #include "model/adapter/ip_adapter.hpp"
 #include "model/adapter/lora.hpp"
 #include "model/adapter/pose_guider.hpp"
+#include "model/adapter/pose_guider_ssd.hpp"
 #include "model/diffusion/anima.hpp"
 #include "model/diffusion/animatediff.hpp"
 #include "model/diffusion/boogu.hpp"
@@ -250,6 +251,17 @@ public:
     // AnimateAnyone pose guider (Moore PoseGuiderA): pose skeleton image ->
     // [W/8, H/8, 320, N] feature added to the UNet conv_in output.
     std::shared_ptr<AnimateAnyone::PoseGuiderRunner> pose_guider;
+    // Sprite-Sheet-Diffusion pose guider variant B (Task 12): mutually
+    // exclusive with `pose_guider` above - variant selection probes the
+    // loaded checkpoint's tensor names ("conv_layers.0.weight" -> B,
+    // "blocks.0.weight" -> A) and only one of the two runners is ever
+    // constructed. Needs a reference-pose image (ref_pose_image_path) in
+    // addition to the per-frame pose images; see docs/animate_anyone.md.
+    std::shared_ptr<AnimateAnyone::PoseGuiderBRunner> pose_guider_b;
+    // Loaded from sd_ctx_params_t::ref_pose_image_path at construction time
+    // (that params struct does not outlive ctor/load), needed later at
+    // generation time by the variant-B branch of generate_animate_anyone().
+    std::string ref_pose_image_path;
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<AudioVAERunner> audio_vae_model;
@@ -757,6 +769,8 @@ public:
                 LOG_WARN("loading reference net from '%s' failed", sd_ctx_params->reference_net_path);
             }
         }
+
+        ref_pose_image_path = SAFE_STR(sd_ctx_params->ref_pose_image_path);
 
         if (strlen(SAFE_STR(sd_ctx_params->pose_guider_path)) > 0) {
             LOG_INFO("loading pose guider from '%s'", sd_ctx_params->pose_guider_path);
@@ -1424,10 +1438,31 @@ public:
                                                                       /*reference_headless=*/true);
                 }
                 if (strlen(SAFE_STR(sd_ctx_params->pose_guider_path)) > 0) {
-                    pose_guider = std::make_shared<AnimateAnyone::PoseGuiderRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                                    tensor_storage_map,
-                                                                                    "pose_guider",
-                                                                                    model_manager);
+                    // Variant selection (Task 12, P-map section 7): probe the
+                    // loaded checkpoint's own tensor names under the
+                    // "pose_guider." prefix. PoseGuiderA's nn.Sequential
+                    // blocks are named "blocks.0.." (Moore); PoseGuiderB's
+                    // outer conv stack is named "conv_layers.0.." (SSD) - the
+                    // two names never collide.
+                    bool is_variant_b = tensor_storage_map.find("pose_guider.conv_layers.0.weight") != tensor_storage_map.end();
+                    bool is_variant_a = tensor_storage_map.find("pose_guider.blocks.0.weight") != tensor_storage_map.end();
+                    if (is_variant_b) {
+                        pose_guider_b = std::make_shared<AnimateAnyone::PoseGuiderBRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                           tensor_storage_map,
+                                                                                           "pose_guider",
+                                                                                           model_manager);
+                    } else {
+                        if (!is_variant_a) {
+                            LOG_WARN("pose_guider checkpoint at '%s' matches neither PoseGuiderA "
+                                     "('blocks.0.weight') nor PoseGuiderB ('conv_layers.0.weight') tensor "
+                                     "names; defaulting to variant A",
+                                     SAFE_STR(sd_ctx_params->pose_guider_path));
+                        }
+                        pose_guider = std::make_shared<AnimateAnyone::PoseGuiderRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                        tensor_storage_map,
+                                                                                        "pose_guider",
+                                                                                        model_manager);
+                    }
                 }
             }
 
@@ -1464,6 +1499,16 @@ public:
                 reference_net->set_stream_layers_enabled(stream_layers);
                 if (!register_runner_params("Reference net",
                                             reference_net,
+                                            SDBackendModule::DIFFUSION,
+                                            &unet_params_mem_size)) {
+                    return false;
+                }
+            }
+
+            if (pose_guider_b) {
+                pose_guider_b->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::DIFFUSION));
+                if (!register_runner_params("Pose guider (variant B)",
+                                            pose_guider_b,
                                             SDBackendModule::DIFFUSION,
                                             &unet_params_mem_size)) {
                     return false;
@@ -6130,8 +6175,15 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
                                     int* num_images_out) {
     StableDiffusionGGML* sd = sd_ctx->sd;
 
-    if (sd->reference_net == nullptr || sd->pose_guider == nullptr) {
+    const bool use_pose_guider_b = sd->pose_guider_b != nullptr;
+    if (sd->reference_net == nullptr || (sd->pose_guider == nullptr && sd->pose_guider_b == nullptr)) {
         LOG_ERROR("AnimateAnyone generation requires --reference-net and --pose-guider");
+        return false;
+    }
+    if (use_pose_guider_b && sd->ref_pose_image_path.empty()) {
+        LOG_ERROR("AnimateAnyone with a Sprite-Sheet-Diffusion (variant B) pose guider requires "
+                  "--ref-pose (the checkpoint's tensor names matched PoseGuiderB's "
+                  "'conv_layers.*' pattern)");
         return false;
     }
     if (sd_img_gen_params->ref_images_count < 1 || sd_img_gen_params->ref_images[0].data == nullptr) {
@@ -6202,17 +6254,36 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
     }
 
     // --- Inputs ---
-    // Pose frames: [0,1], NO [-1,1] rescale (Moore cond_image_processor
-    // do_normalize=False), full resolution, stacked on the frame axis (ne[3];
-    // the pose guider's convs treat it as a batch axis, exactly how the
-    // reference runs the guider once over the whole (1,3,F,H,W) clip).
+    // Pose frames: variant A (Moore) keeps [0,1], NO [-1,1] rescale
+    // (cond_image_processor do_normalize=False); variant B (Sprite-Sheet-
+    // Diffusion) DOES rescale to [-1,1] (do_normalize=True - P-map porting
+    // note 5, task 12 brief). Full resolution, stacked on the frame axis
+    // (ne[3]; the pose guider's convs treat it as a batch axis, exactly how
+    // the reference runs the guider once over the whole (1,3,F,H,W) clip).
     sd::Tensor<float> pose_cond({W, H, 3, F});
     for (int f = 0; f < F; ++f) {
         sd::Tensor<float> pose = aa_load_image_tensor(pose_files[f], W, H, true);
         if (pose.empty()) {
             return false;
         }
+        if (use_pose_guider_b) {
+            for (int64_t i = 0; i < pose.numel(); i++) {
+                pose.data()[i] = pose.data()[i] * 2.f - 1.f;
+            }
+        }
         sd::ops::slice_assign(&pose_cond, 3, f, f + 1, pose);
+    }
+
+    sd::Tensor<float> ref_pose_cond;  // variant B only; unused (but shape-required) otherwise
+    if (use_pose_guider_b) {
+        ref_pose_cond = aa_load_image_tensor(sd->ref_pose_image_path, W, H, true);
+        if (ref_pose_cond.empty()) {
+            LOG_ERROR("failed to load --ref-pose '%s'", sd->ref_pose_image_path.c_str());
+            return false;
+        }
+        for (int64_t i = 0; i < ref_pose_cond.numel(); i++) {
+            ref_pose_cond.data()[i] = ref_pose_cond.data()[i] * 2.f - 1.f;
+        }
     }
 
     // Reference image, twice: original resolution for the CLIP-vision path
@@ -6257,8 +6328,21 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
     }
 
     // --- 3. Pose guider forward (once; timestep-independent). ---
-    sd::Tensor<float> pose_feature = sd->pose_guider->compute(sd->n_threads, pose_cond);
-    sd->pose_guider->runner_done();
+    sd::Tensor<float> pose_feature;                         // fea[0], added after conv_in (both variants)
+    std::vector<sd::Tensor<float>> pose_feature_pyramid;    // fea[1..4], added after down_blocks.{0..3} (variant B only)
+    if (use_pose_guider_b) {
+        std::vector<sd::Tensor<float>> feas = sd->pose_guider_b->compute(sd->n_threads, pose_cond, ref_pose_cond);
+        sd->pose_guider_b->runner_done();
+        if (feas.size() != 5) {
+            LOG_ERROR("pose guider (variant B) forward failed (got %zu/5 pyramid features)", feas.size());
+            return false;
+        }
+        pose_feature = std::move(feas[0]);
+        pose_feature_pyramid.assign(feas.begin() + 1, feas.end());
+    } else {
+        pose_feature = sd->pose_guider->compute(sd->n_threads, pose_cond);
+        sd->pose_guider->runner_done();
+    }
     if (pose_feature.empty()) {
         LOG_ERROR("pose guider forward failed");
         return false;
@@ -6381,12 +6465,24 @@ static bool generate_animate_anyone(sd_ctx_t* sd_ctx,
             sd::Tensor<float> pose_feature_win = aa_gather_frames(pose_feature, window);
             const int window_size              = (int)window.size();
 
+            // Variant B multi-scale pyramid: each level is gathered per-window
+            // the same way pose_feature_win is above (each PoseGuiderB pyramid
+            // level carries its own per-frame batch axis, same F as x).
+            std::vector<sd::Tensor<float>> pose_feature_pyramid_win;
+            if (use_pose_guider_b) {
+                pose_feature_pyramid_win.reserve(pose_feature_pyramid.size());
+                for (const auto& level : pose_feature_pyramid) {
+                    pose_feature_pyramid_win.push_back(aa_gather_frames(level, window));
+                }
+            }
+
             for (int h = do_cfg ? 0 : 1; h < 2; ++h) {
                 UNetDiffusionExtra extra;
                 extra.num_video_frames = window_size;
                 extra.aa_banks         = (h == 0) ? nullptr : &banks;
                 extra.aa_is_uncond     = (h == 0);
                 extra.aa_pose_feature  = &pose_feature_win;
+                extra.aa_pose_feature_pyramid = use_pose_guider_b ? &pose_feature_pyramid_win : nullptr;
                 // A window of exactly 1 frame (whole-clip F==1, plain image
                 // generation - the only way a window can be size 1, since
                 // aa_context_windows()'s F<=context_size branch yields

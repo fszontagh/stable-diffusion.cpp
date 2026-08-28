@@ -59,6 +59,13 @@ struct UNetDiffusionExtra {
     const std::vector<sd::Tensor<float>>* aa_banks = nullptr;
     bool aa_is_uncond                              = false;
     const sd::Tensor<float>* aa_pose_feature       = nullptr;
+    // Sprite-Sheet-Diffusion pose guider variant B (Task 12): 4 multi-scale
+    // pyramid features (320/640/1280/1280 channels, added after down blocks
+    // 0..3 respectively - fea[0] of the 5 returned by PoseGuiderB goes
+    // through aa_pose_feature above instead, added after conv_in like variant
+    // A). nullptr/empty for every existing family and for variant A; only set
+    // when a PoseGuiderB checkpoint was loaded (variant selection, Task 12).
+    const std::vector<sd::Tensor<float>>* aa_pose_feature_pyramid = nullptr;
     // Skip the motion modules for this forward (single-frame generation).
     // The motion modules were trained on 24-frame windows; at F=1 their
     // temporal self-attention degenerates (verified empirically in task 9:

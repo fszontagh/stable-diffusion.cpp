@@ -561,7 +561,8 @@ public:
                          std::vector<ggml_tensor*> controls = {},
                          float control_strength             = 0.f,
                          ggml_tensor* pose_feature          = nullptr,
-                         bool aa_spatial_only               = false) {
+                         bool aa_spatial_only               = false,
+                         const std::vector<ggml_tensor*>& pose_feature_pyramid = {}) {
         // x: [N, in_channels, h, w] or [N, in_channels/2, h, w]
         // timesteps: [N,]
         // context: [N, max_position, hidden_size] or [1, max_position, hidden_size]. for example, [N, 77, 768]
@@ -733,6 +734,26 @@ public:
                 // sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks." + std::to_string(input_block_idx), "h");
                 hs.push_back(h);
             }
+            // Sprite-Sheet-Diffusion pose guider variant B (Task 12, P-map
+            // section 6 "Consumption changed in unet_3d.py"): a ControlNet-like
+            // multi-scale injection, "sample = sample + pose_cond_fea[block_count]
+            // after each down block" (unet_3d.py:509-511) - fea[0] was already
+            // added after conv_in above (shared with variant A); fea[1..4] land
+            // here, one per down_blocks.{0..3} iteration of this very loop
+            // (down_blocks 0-2 end with their downsampler, down_blocks 3 has
+            // none - both cases are "the end of this i'th iteration", which is
+            // exactly here). This only nudges the trunk `h` fed into the next
+            // block/mid_block - the skip-connection tensors already pushed onto
+            // `hs` for this block are left untouched, matching diffusers'
+            // per-resnet down_block_res_samples semantics. Empty vector for
+            // every existing family and for variant A: fully inert.
+            if (i < (int)pose_feature_pyramid.size() && pose_feature_pyramid[i] != nullptr) {
+                ggml_tensor* feat = pose_feature_pyramid[i];
+                if (feat->ne[3] != h->ne[3]) {
+                    feat = ggml_repeat(ctx->ggml_ctx, feat, h);
+                }
+                h = ggml_add(ctx->ggml_ctx, h, feat);
+            }
         }
         // [N, 4*model_channels, h/8, w/8]
 
@@ -898,7 +919,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                              const std::vector<sd::Tensor<float>>* aa_banks        = nullptr,
                              bool aa_is_uncond                                     = false,
                              const sd::Tensor<float>& aa_pose_feature              = {},
-                             bool aa_spatial_only                                  = false) {
+                             bool aa_spatial_only                                  = false,
+                             const std::vector<sd::Tensor<float>>* aa_pose_feature_pyramid = nullptr) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
 
         ggml_tensor* x            = make_input(x_tensor);
@@ -908,6 +930,13 @@ struct UNetModelRunner : public DiffusionModelRunner {
         ggml_tensor* y            = make_optional_input(y_tensor);
         ggml_tensor* ip_context   = make_optional_input(ip_context_tensor);
         ggml_tensor* pose_feature = make_optional_input(aa_pose_feature);
+        std::vector<ggml_tensor*> pose_feature_pyramid;
+        if (aa_pose_feature_pyramid != nullptr) {
+            pose_feature_pyramid.reserve(aa_pose_feature_pyramid->size());
+            for (const auto& t : *aa_pose_feature_pyramid) {
+                pose_feature_pyramid.push_back(make_optional_input(t));
+            }
+        }
         std::vector<ggml_tensor*> controls;
         controls.reserve(controls_tensor.size());
         for (const auto& control_tensor : controls_tensor) {
@@ -980,7 +1009,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                                         controls,
                                         control_strength,
                                         pose_feature,
-                                        aa_spatial_only);
+                                        aa_spatial_only,
+                                        pose_feature_pyramid);
 
         ggml_build_forward_expand(gf, out);
 
@@ -1001,7 +1031,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                               const std::vector<sd::Tensor<float>>* aa_banks = nullptr,
                               bool aa_is_uncond                              = false,
                               const sd::Tensor<float>& aa_pose_feature       = {},
-                              bool aa_spatial_only                           = false) {
+                              bool aa_spatial_only                           = false,
+                              const std::vector<sd::Tensor<float>>* aa_pose_feature_pyramid = nullptr) {
         // x: [N, in_channels, h, w]
         // timesteps: [N, ]
         // context: [N, max_position, hidden_size]([N, 77, 768]) or [1, max_position, hidden_size]
@@ -1009,7 +1040,7 @@ struct UNetModelRunner : public DiffusionModelRunner {
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         auto get_graph = [&]() -> ggml_cgraph* {
             return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls, control_strength, ip_context, ip_scale,
-                               aa_banks, aa_is_uncond, aa_pose_feature, aa_spatial_only);
+                               aa_banks, aa_is_uncond, aa_pose_feature, aa_spatial_only, aa_pose_feature_pyramid);
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
@@ -1035,7 +1066,8 @@ struct UNetModelRunner : public DiffusionModelRunner {
                        extra->aa_banks,
                        extra->aa_is_uncond,
                        extra->aa_pose_feature ? *extra->aa_pose_feature : sd::Tensor<float>{},
-                       extra->aa_spatial_only);
+                       extra->aa_spatial_only,
+                       extra->aa_pose_feature_pyramid);
     }
 
     // AnimateAnyone ReferenceNet: one forward at t=0 with the CFG-doubled ref
