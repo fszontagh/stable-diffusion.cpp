@@ -804,7 +804,9 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     // libstdc++ std::regex recurses per matched character; unbounded runs overflow
     // the stack. Split runs are merged back by the equal-weight pass below.
     const int max_plain_text_run = 1024;
-    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]+)\)|\)|\]|\bBREAK\b|[^\\()\[\]:B]{1,)" +
+    const int max_weight_chars   = 32;
+    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]{1,)" +
+                            std::to_string(max_weight_chars) + R"(})\)|\)|\]|\bBREAK\b|[^\\()\[\]:B]{1,)" +
                             std::to_string(max_plain_text_run) + R"(}|:|\bB)");
     std::regex re_break(R"(\s*\bBREAK\b\s*)");
 
@@ -827,7 +829,13 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
             square_brackets.push_back((int)res.size());
         } else if (!weight.empty()) {
             if (!round_brackets.empty()) {
-                multiply_range(round_brackets.back(), std::stof(weight));
+                // strtof does not throw, and a non-finite weight would poison every
+                // multiplier that follows.
+                float weight_value = std::strtof(weight.c_str(), nullptr);
+                if (!std::isfinite(weight_value)) {
+                    weight_value = 1.0f;
+                }
+                multiply_range(round_brackets.back(), weight_value);
                 round_brackets.pop_back();
             }
         } else if (text == ")" && !round_brackets.empty()) {
