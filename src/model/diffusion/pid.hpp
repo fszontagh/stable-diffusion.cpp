@@ -109,16 +109,16 @@ namespace Pid {
                 config.lq_latent_channels    = latent_proj_in_channels;
                 config.lq_latent_down_factor = latent_proj_in_channels >= 64 ? 16 : 8;
             }
-            LOG_DEBUG("pid: version = %s, patch_depth = %" PRId64 ", pixel_depth = %" PRId64 ", patch_mlp_hidden_dim = %" PRId64 ", lq_latent_channels = %" PRId64 ", lq_hidden_dim = %" PRId64 ", lq_latent_down_factor = %" PRId64 ", lq_latent_unpatchify_factor = %" PRId64 ", lq_interval = %" PRId64,
-                      config.pit_lq_inject ? "1.5" : "1",
-                      config.patch_depth,
-                      config.pixel_depth,
-                      config.patch_mlp_hidden_dim,
-                      config.lq_latent_channels,
-                      config.lq_hidden_dim,
-                      config.lq_latent_down_factor,
-                      config.lq_latent_unpatchify_factor,
-                      config.lq_interval);
+            LOG_VERBOSE("pid: version = %s, patch_depth = %" PRId64 ", pixel_depth = %" PRId64 ", patch_mlp_hidden_dim = %" PRId64 ", lq_latent_channels = %" PRId64 ", lq_hidden_dim = %" PRId64 ", lq_latent_down_factor = %" PRId64 ", lq_latent_unpatchify_factor = %" PRId64 ", lq_interval = %" PRId64,
+                        config.pit_lq_inject ? "1.5" : "1",
+                        config.patch_depth,
+                        config.pixel_depth,
+                        config.patch_mlp_hidden_dim,
+                        config.lq_latent_channels,
+                        config.lq_hidden_dim,
+                        config.lq_latent_down_factor,
+                        config.lq_latent_unpatchify_factor,
+                        config.lq_interval);
             return config;
         }
     };
@@ -938,7 +938,7 @@ namespace Pid {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context, lq_latent, degrade_sigma);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,

@@ -46,11 +46,11 @@ namespace Anima {
             }
             if (detected_layers > 0) {
                 config.num_layers = detected_layers;
-                LOG_DEBUG("anima: num_layers = %" PRId64 ", hidden_size = %" PRId64 ", num_heads = %" PRId64 ", head_dim = %" PRId64,
-                          config.num_layers,
-                          config.hidden_size,
-                          config.num_heads,
-                          config.head_dim);
+                LOG_VERBOSE("anima: num_layers = %" PRId64 ", hidden_size = %" PRId64 ", num_heads = %" PRId64 ", head_dim = %" PRId64,
+                            config.num_layers,
+                            config.hidden_size,
+                            config.num_heads,
+                            config.head_dim);
             }
             return config;
         }
@@ -717,7 +717,7 @@ namespace Anima {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context, t5_ids, t5_weights, ref_latents);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,

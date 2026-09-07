@@ -106,14 +106,14 @@ namespace MiniMaxH3 {
                 config.rope_inv_freq_len = inv_freq->ne[0];
             }
 
-            LOG_DEBUG("minimax_h3: layers=%" PRId64 ", hidden=%" PRId64 ", heads=%" PRId64
-                      ", head_dim=%" PRId64 ", ffn=%" PRId64 ", adaln_curve=%" PRId64,
-                      config.num_layers,
-                      config.hidden_size,
-                      config.num_attention_heads,
-                      config.attention_head_dim,
-                      config.ffn_hidden_size,
-                      config.adaln_curve_grid);
+            LOG_VERBOSE("minimax_h3: layers=%" PRId64 ", hidden=%" PRId64 ", heads=%" PRId64
+                        ", head_dim=%" PRId64 ", ffn=%" PRId64 ", adaln_curve=%" PRId64,
+                        config.num_layers,
+                        config.hidden_size,
+                        config.num_attention_heads,
+                        config.attention_head_dim,
+                        config.ffn_hidden_size,
+                        config.adaln_curve_grid);
             return config;
         }
     };
@@ -1168,8 +1168,6 @@ namespace MiniMaxH3 {
             };
             return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
                                                                               n_threads,
-                                                                              false,
-                                                                              false,
                                                                               false),
                                                    params.x->dim());
         }
