@@ -758,6 +758,15 @@ namespace Hunyuan {
             return "hunyuan_video_vae";
         }
 
+        bool supports_temporal_tiling(VAETemporalDirection direction) const override {
+            return direction == VAETemporalDirection::DECODE;
+        }
+
+        int get_temporal_tile_output_scale(VAETemporalDirection direction) const override {
+            SD_UNUSED(direction);
+            return 4;
+        }
+
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
             if (!decode_only) {
                 encoder.get_param_tensors(tensors, weight_prefix + ".encoder");
@@ -818,9 +827,7 @@ namespace Hunyuan {
             };
             auto output = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
                                                                                      n_threads,
-                                                                                     true,
-                                                                                     true,
-                                                                                     true),
+                                                                                     false),
                                                           graph_input.dim());
             if (!output.empty() && input.dim() == 4) {
                 output.squeeze_(2);

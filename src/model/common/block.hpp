@@ -268,10 +268,11 @@ public:
                 int64_t dim_out,
                 int64_t mult          = 4,
                 Activation activation = Activation::GEGLU,
-                bool precision_fix    = false) {
+                bool precision_fix    = false,
+                bool bias             = true) {
         int64_t inner_dim = dim * mult;
         if (activation == Activation::GELU) {
-            blocks["net.0"] = std::shared_ptr<GGMLBlock>(new GELU(dim, inner_dim));
+            blocks["net.0"] = std::shared_ptr<GGMLBlock>(new GELU(dim, inner_dim, bias));
         } else {
             blocks["net.0"] = std::shared_ptr<GGMLBlock>(new GEGLU(dim, inner_dim));
         }
@@ -285,7 +286,7 @@ public:
         // The purpose of the scale here is to prevent NaN issues in certain situations.
         // For example, when using Vulkan without enabling force_prec_f32,
         // or when using CUDA but the weights are k-quants.
-        blocks["net.2"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, dim_out, true, false, force_prec_f32, scale));
+        blocks["net.2"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, dim_out, bias, false, force_prec_f32, scale));
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -339,7 +340,7 @@ public:
           enable_ip(enable_ip) {
         int64_t inner_dim = d_head * n_head;
         if (context_dim == 320 && d_head == 320) {
-            // LOG_DEBUG("CrossAttention: temp set dim to 1024 for sdxs_09");
+            // LOG_VERBOSE("CrossAttention: temp set dim to 1024 for sdxs_09");
             xtra_dim    = true;
             context_dim = 1024;
         }
@@ -369,7 +370,7 @@ public:
 
         auto q = to_q->forward(ctx, x);  // [N, n_token, inner_dim]
         if (xtra_dim) {
-            // LOG_DEBUG("CrossAttention: temp set dim to 1024 for sdxs_09");
+            // LOG_VERBOSE("CrossAttention: temp set dim to 1024 for sdxs_09");
             context->ne[0] = 1024;  // patch dim
         }
         auto k = to_k->forward(ctx, context);  // [N, n_context, inner_dim]

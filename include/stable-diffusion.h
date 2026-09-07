@@ -147,6 +147,7 @@ enum sd_type_t {
 
 enum sd_log_level_t {
     SD_LOG_DEBUG,
+    SD_LOG_VERBOSE,
     SD_LOG_INFO,
     SD_LOG_WARN,
     SD_LOG_ERROR
@@ -229,8 +230,8 @@ typedef struct {
     bool vae_conv_direct;
     bool force_sdxl_vae_conv_scale;
     enum sd_vae_format_t vae_format;
-    const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (0 = disabled, -1 = auto)
-    bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
+    const char* max_vram;  // Optional per-device GiB budget for managed weights and runner buffers; 0 uses live free VRAM without an explicit budget
+    bool disable_prefetch;  // Disable asynchronous next-segment weight prefetch
     bool eager_load;  // Load all params into the params backend at model-load time instead of lazily on first use
     const char* backend;
     const char* params_backend;
@@ -238,6 +239,7 @@ typedef struct {
     bool auto_fit;
     const char* rpc_servers;
     const char* model_args;
+    bool disable_segmented_compute;  // Force monolithic graph execution even when automatic graph cutting would fit memory better
 } sd_ctx_params_t;
 
 typedef struct {
@@ -446,6 +448,9 @@ typedef bool (*sd_graph_eval_callback_t)(struct ggml_tensor* t, bool ask, void* 
 
 SD_API void sd_set_log_callback(sd_log_cb_t sd_log_cb, void* data);
 SD_API void sd_set_progress_callback(sd_progress_cb_t cb, void* data);
+// In each sampling pass, a positive interval previews every Nth denoiser step, while a
+// negative interval previews only completed logical step -interval. Zero previews the final
+// completed step of the first sampling pass (base-resolution or high-noise).
 SD_API void sd_set_preview_callback(sd_preview_cb_t cb, enum preview_t mode, int interval, bool denoised, bool noisy, void* data);
 SD_API void sd_set_backend_eval_callback(sd_graph_eval_callback_t cb, void* data);
 SD_API int32_t sd_get_num_physical_cores();

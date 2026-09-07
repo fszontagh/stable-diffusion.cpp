@@ -451,13 +451,11 @@ struct T5Runner : public GGMLRunner {
     sd::Tensor<float> compute(const int n_threads,
                               const sd::Tensor<int32_t>& input_ids,
                               const sd::Tensor<float>& attention_mask,
-                              bool auto_free           = true,
-                              bool free_compute_buffer = true,
-                              bool free_compute_params = true) {
+                              bool auto_runner_end = true) {
         auto get_graph = [&]() -> ggml_cgraph* {
             return build_graph(input_ids, attention_mask);
         };
-        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, auto_free, free_compute_buffer, free_compute_params), 3);
+        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, auto_runner_end), 3);
     }
 
     static std::vector<int> _relative_position_bucket(const std::vector<int>& relative_position,
@@ -556,7 +554,7 @@ struct T5Embedder {
                 ss << "['" << item.first << "', " << item.second << "], ";
             }
             ss << "]";
-            LOG_DEBUG("parse '%s' to %s", text.c_str(), ss.str().c_str());
+            LOG_VERBOSE("parse '%s' to %s", text.c_str(), ss.str().c_str());
         }
 
         std::vector<int> tokens;
@@ -614,7 +612,7 @@ struct T5Embedder {
             GGML_ASSERT(!out_opt.empty());
             out = std::move(out_opt);
             print_sd_tensor(out);
-            LOG_DEBUG("t5 test done in %lldms", t1 - t0);
+            LOG_VERBOSE("t5 test done in %lldms", t1 - t0);
         }
     }
 

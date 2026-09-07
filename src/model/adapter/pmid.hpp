@@ -558,7 +558,7 @@ public:
             return build_graph(id_pixel_values, prompt_embeds, class_tokens_mask, id_embeds);
         };
 
-        return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, true, true, true));
+        return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, true));
     }
 };
 
@@ -639,7 +639,7 @@ struct PhotoMakerIDEmbed : public GGMLRunner {
             return false;
         }
 
-        LOG_DEBUG("finished loading PhotoMaker ID Embeds ");
+        LOG_VERBOSE("finished loading PhotoMaker ID Embeds ");
         return true;
     }
 

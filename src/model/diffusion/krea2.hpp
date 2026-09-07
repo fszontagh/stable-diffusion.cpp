@@ -143,16 +143,16 @@ namespace Krea2 {
             }
             config.update_axes_dim();
 
-            LOG_DEBUG("krea2: layers=%" PRId64 ", features=%" PRId64 ", heads=%" PRId64 ", kv_heads=%" PRId64 ", text_dim=%" PRId64 ", text_layers=%" PRId64 ", text_heads=%" PRId64 ", text_kv_heads=%" PRId64 ", channels=%" PRId64,
-                      config.layers,
-                      config.features,
-                      config.heads,
-                      config.kv_heads,
-                      config.text_dim,
-                      config.text_layers,
-                      config.text_heads,
-                      config.text_kv_heads,
-                      config.in_channels);
+            LOG_VERBOSE("krea2: layers=%" PRId64 ", features=%" PRId64 ", heads=%" PRId64 ", kv_heads=%" PRId64 ", text_dim=%" PRId64 ", text_layers=%" PRId64 ", text_heads=%" PRId64 ", text_kv_heads=%" PRId64 ", channels=%" PRId64,
+                        config.layers,
+                        config.features,
+                        config.heads,
+                        config.kv_heads,
+                        config.text_dim,
+                        config.text_layers,
+                        config.text_heads,
+                        config.text_kv_heads,
+                        config.in_channels);
             return config;
         }
     };
@@ -775,7 +775,7 @@ namespace Krea2 {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context, ref_latents, ref_image_params);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,
