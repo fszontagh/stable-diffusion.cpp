@@ -804,9 +804,7 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     // libstdc++ std::regex recurses per matched character; unbounded runs overflow
     // the stack. Split runs are merged back by the equal-weight pass below.
     const int max_plain_text_run = 1024;
-    const int max_weight_chars   = 32;
-    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|:([+-]?[.\d]{1,)" +
-                            std::to_string(max_weight_chars) + R"(})\)|\)|\]|\bBREAK\b|[^\\()\[\]:B]{1,)" +
+    std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|\)|\]|\bBREAK\b|[^\\()\[\]:B]{1,)" +
                             std::to_string(max_plain_text_run) + R"(}|:|\bB)");
     std::regex re_break(R"(\s*\bBREAK\b\s*)");
 
@@ -816,28 +814,57 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
         }
     };
 
+    // Lexed here rather than in the regex: a bounded repetition would reject long
+    // but valid weights, and an unbounded one is what overflows the stack.
+    // Returns the length of ":<weight>)" past the colon, or 0 if it is not a weight.
+    auto lex_weight = [](const std::string& s, float& value) -> size_t {
+        size_t end = 0;
+        if (end < s.size() && (s[end] == '+' || s[end] == '-')) {
+            ++end;
+        }
+        while (end < s.size() && (std::isdigit((unsigned char)s[end]) || s[end] == '.')) {
+            ++end;
+        }
+        if (end >= s.size() || s[end] != ')') {
+            return 0;
+        }
+        std::string number   = s.substr(0, end);
+        char* number_end     = nullptr;
+        float parsed         = std::strtof(number.c_str(), &number_end);
+        const char* expected = number.c_str() + number.size();
+        // A partial parse means the text is not a number at all (".", "+.", "1.2.3");
+        // a non-finite value would poison every multiplier that follows.
+        if (number.empty() || number_end != expected || !std::isfinite(parsed)) {
+            return 0;
+        }
+        value = parsed;
+        return end + 1;
+    };
+
     std::smatch m, m2;
     std::string remaining_text = text;
 
     while (std::regex_search(remaining_text, m, re_attention)) {
         std::string text   = m[0];
-        std::string weight = m[1];
+        std::string suffix = m.suffix();
+
+        if (text == ":") {
+            float weight_value   = 1.0f;
+            size_t weight_length = lex_weight(suffix, weight_value);
+            if (weight_length > 0) {
+                if (!round_brackets.empty()) {
+                    multiply_range(round_brackets.back(), weight_value);
+                    round_brackets.pop_back();
+                }
+                remaining_text = suffix.substr(weight_length);
+                continue;
+            }
+        }
 
         if (text == "(") {
             round_brackets.push_back((int)res.size());
         } else if (text == "[") {
             square_brackets.push_back((int)res.size());
-        } else if (!weight.empty()) {
-            if (!round_brackets.empty()) {
-                // strtof does not throw, and a non-finite weight would poison every
-                // multiplier that follows.
-                float weight_value = std::strtof(weight.c_str(), nullptr);
-                if (!std::isfinite(weight_value)) {
-                    weight_value = 1.0f;
-                }
-                multiply_range(round_brackets.back(), weight_value);
-                round_brackets.pop_back();
-            }
         } else if (text == ")" && !round_brackets.empty()) {
             multiply_range(round_brackets.back(), round_bracket_multiplier);
             round_brackets.pop_back();
@@ -852,7 +879,7 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
             res.push_back({text, 1.0f});
         }
 
-        remaining_text = m.suffix();
+        remaining_text = suffix;
     }
 
     for (int pos : round_brackets) {
