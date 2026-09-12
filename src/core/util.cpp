@@ -821,8 +821,8 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
     float round_bracket_multiplier  = 1.1f;
     float square_bracket_multiplier = 1 / 1.1f;
 
-    // libstdc++ std::regex recurses per matched character; unbounded runs overflow
-    // the stack. Split runs are merged back by the equal-weight pass below.
+    // libstdc++ std::regex recurses per matched character, so unbounded runs
+    // overflow the stack. Split runs are merged back below.
     const int max_plain_text_run = 1024;
     std::regex re_attention(R"(\\\(|\\\)|\\\[|\\\]|\\\\|\\|\(|\[|\)|\]|\bBREAK\b|[^\\()\[\]:B]{1,)" +
                             std::to_string(max_plain_text_run) + R"(}|:|\bB)");
@@ -834,9 +834,8 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
         }
     };
 
-    // Lexed here rather than in the regex: a bounded repetition would reject long
-    // but valid weights, and an unbounded one is what overflows the stack.
-    // Returns the length of ":<weight>)" past the colon, or 0 if it is not a weight.
+    // Kept out of the regex: bounding the repetition rejects valid long weights,
+    // leaving it unbounded overflows the stack.
     auto lex_weight = [](const std::string& s, float& value) -> size_t {
         size_t end = 0;
         if (end < s.size() && (s[end] == '+' || s[end] == '-')) {
@@ -852,8 +851,7 @@ std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::str
         char* number_end     = nullptr;
         float parsed         = std::strtof(number.c_str(), &number_end);
         const char* expected = number.c_str() + number.size();
-        // A partial parse means the text is not a number at all (".", "+.", "1.2.3");
-        // a non-finite value would poison every multiplier that follows.
+        // Without this ".", "+." and "1.2.3" would silently become weights.
         if (number.empty() || number_end != expected || !std::isfinite(parsed)) {
             return 0;
         }
